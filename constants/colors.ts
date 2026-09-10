@@ -1,0 +1,16 @@
+export const Colors = {
+  background: '#080908',
+  primary: '#FDA83A',
+  primaryHighlight: '#FFB347',
+  card: '#1B1B1B',
+  surfaceTranslucent: 'rgba(217, 217, 217, 0.12)',
+  navBackground: 'rgba(217, 217, 217, 0.20)',
+  navBackgroundFallback: 'rgba(30, 30, 30, 0.85)',
+  text: '#FFFFFF',
+  textSecondary: '#A5A5A5',
+  textMuted: '#747474',
+  success: '#49C779',
+  warning: '#FDA83A',
+  critical: '#FF625F',
+  offline: '#777777',
+};
