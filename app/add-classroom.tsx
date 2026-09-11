@@ -10,6 +10,17 @@ import { Classroom } from '../types';
 
 const STEPS = ['Basics', 'Location', 'Controller', 'Capacity', 'Review'] as const;
 
+function getMockControllerIp(classrooms: Classroom[]) {
+  const usedIps = new Set(classrooms.map(classroom => classroom.controller.ipAddress));
+
+  for (let host = 100; host <= 254; host += 1) {
+    const ip = `192.168.1.${host}`;
+    if (!usedIps.has(ip)) return ip;
+  }
+
+  return '192.168.1.250';
+}
+
 export default function AddClassroomScreen() {
   const { addClassroom, classrooms } = useApp();
   const router = useRouter();
@@ -21,7 +32,7 @@ export default function AddClassroomScreen() {
   const [department, setDepartment] = useState('IMCA');
   const [building, setBuilding] = useState('');
   const [floor, setFloor] = useState('');
-  const [controllerIp, setControllerIp] = useState('');
+  const [controllerIp, setControllerIp] = useState(() => getMockControllerIp(classrooms));
   const [capacity, setCapacity] = useState('');
 
   const isValidIp = (ip: string) => {
@@ -158,7 +169,7 @@ export default function AddClassroomScreen() {
             <Text style={styles.stepTitle}>Controller Setup</Text>
             <Text style={styles.stepSubtitle}>ESP32 controller configuration</Text>
             <View style={styles.inputGroup}>
-              <Text style={styles.inputLabel}>Controller IP Address</Text>
+              <Text style={styles.inputLabel}>Mock ESP32 IP Address</Text>
               <TextInput
                 style={[styles.input, controllerIp.length > 0 && !isValidIp(controllerIp) && { borderColor: Colors.critical }]}
                 placeholder="e.g. 192.168.1.100"
