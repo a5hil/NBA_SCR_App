@@ -1,0 +1,169 @@
+import React from 'react';
+import { View, Text, StyleSheet, TouchableOpacity } from 'react-native';
+import { Colors } from '../constants/colors';
+import { Layout } from '../constants/layout';
+import { Ionicons } from '@expo/vector-icons';
+import { useApp } from '../context/AppContext';
+import { useRouter } from 'expo-router';
+
+export function EnergyOverviewCard() {
+  const { classrooms } = useApp();
+  const router = useRouter();
+
+  // Calculate totals
+  let totalEnergy = 0;
+  let totalLoad = 0;
+  let activeDevices = 0;
+  
+  classrooms.forEach(cls => {
+    totalEnergy += cls.energyToday;
+    totalLoad += cls.currentLoad;
+    activeDevices += cls.devices.filter(d => d.status === 'on').length;
+  });
+
+  return (
+    <View style={styles.container}>
+      <TouchableOpacity 
+        style={styles.mainCard} 
+        activeOpacity={0.8}
+        onPress={() => router.push('/energy')}
+      >
+        <View style={styles.cardHeader}>
+          <View style={styles.iconContainer}>
+            <Ionicons name="flash" size={20} color="#000" />
+          </View>
+          <Text style={styles.cardTitle}>Today's Energy</Text>
+        </View>
+        <View style={styles.cardBody}>
+          <Text style={styles.energyValue}>{totalEnergy.toFixed(1)}</Text>
+          <Text style={styles.energyUnit}>kWh</Text>
+        </View>
+        <View style={styles.cardFooter}>
+          <Ionicons name="trending-up" size={16} color="rgba(0,0,0,0.6)" />
+          <Text style={styles.footerText}>12% vs yesterday</Text>
+        </View>
+      </TouchableOpacity>
+
+      <View style={styles.sideCards}>
+        <View style={styles.sideCard}>
+          <View style={[styles.iconContainerSide, { backgroundColor: 'rgba(253, 168, 58, 0.15)' }]}>
+            <Ionicons name="power" size={16} color={Colors.primary} />
+          </View>
+          <View style={styles.sideCardTextContainer}>
+            <Text style={styles.sideCardLabel}>Current Load</Text>
+            <Text style={styles.sideCardValue}>{(totalLoad / 1000).toFixed(2)} kW</Text>
+          </View>
+        </View>
+
+        <View style={styles.sideCard}>
+          <View style={[styles.iconContainerSide, { backgroundColor: 'rgba(76, 175, 80, 0.15)' }]}>
+            <Ionicons name="radio-button-on" size={16} color={Colors.success} />
+          </View>
+          <View style={styles.sideCardTextContainer}>
+            <Text style={styles.sideCardLabel}>Active Devices</Text>
+            <Text style={styles.sideCardValue}>{activeDevices}</Text>
+          </View>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flexDirection: 'row',
+    paddingHorizontal: Layout.spacing.md,
+    gap: 12,
+    marginBottom: 24,
+  },
+  mainCard: {
+    flex: 1,
+    backgroundColor: Colors.primary,
+    borderRadius: Layout.radius.lg,
+    padding: 16,
+    justifyContent: 'space-between',
+  },
+  cardHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 16,
+  },
+  iconContainer: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    backgroundColor: 'rgba(0,0,0,0.1)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  cardTitle: {
+    color: '#000',
+    fontSize: 14,
+    fontWeight: '600',
+    opacity: 0.8,
+  },
+  cardBody: {
+    flexDirection: 'row',
+    alignItems: 'baseline',
+    marginBottom: 16,
+  },
+  energyValue: {
+    color: '#000',
+    fontSize: 36,
+    fontWeight: '800',
+    letterSpacing: -1,
+  },
+  energyUnit: {
+    color: '#000',
+    fontSize: 16,
+    fontWeight: '600',
+    marginLeft: 4,
+    opacity: 0.8,
+  },
+  cardFooter: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+  },
+  footerText: {
+    color: 'rgba(0,0,0,0.6)',
+    fontSize: 12,
+    fontWeight: '500',
+  },
+  sideCards: {
+    flex: 0.8,
+    justifyContent: 'space-between',
+    gap: 12,
+  },
+  sideCard: {
+    flex: 1,
+    backgroundColor: Colors.card,
+    borderRadius: Layout.radius.lg,
+    padding: 12,
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: Colors.surfaceTranslucent,
+  },
+  iconContainerSide: {
+    width: 32,
+    height: 32,
+    borderRadius: 16,
+    justifyContent: 'center',
+    alignItems: 'center',
+    marginBottom: 8,
+  },
+  sideCardTextContainer: {
+    justifyContent: 'flex-end',
+  },
+  sideCardLabel: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    marginBottom: 2,
+  },
+  sideCardValue: {
+    color: Colors.text,
+    fontSize: 16,
+    fontWeight: '700',
+  },
+});
