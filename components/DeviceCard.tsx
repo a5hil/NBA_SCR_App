@@ -8,30 +8,35 @@ import { useRouter } from 'expo-router';
 
 interface DeviceCardProps {
   device: Device;
+  classroomId?: string;
   onToggle: () => void;
 }
 
-export function DeviceCard({ device, onToggle }: DeviceCardProps) {
+export function DeviceCard({ device, classroomId, onToggle }: DeviceCardProps) {
   const router = useRouter();
   const isOn = device.status === 'on';
   const isOffline = device.status === 'offline';
+  const isCurtain = device.category === 'curtain';
+
+  const targetClassroomId = classroomId || (
+    device.id.includes('a101') ? 'cls-a101' :
+    device.id.includes('a102') ? 'cls-a102' :
+    'cls-corridor'
+  );
 
   const getIcon = () => {
     switch (device.category) {
       case 'light': return 'bulb';
-      case 'fan': return 'hardware-chip'; // closest to fan
-      case 'exhaust-fan': return 'aperture';
-      case 'ac': return 'snow';
-      case 'projector': return 'videocam';
-      case 'smart-board': return 'tv';
-      case 'television': return 'desktop';
-      case 'speaker': return 'volume-high';
-      case 'cctv': return 'videocam';
-      case 'smart-lock': return 'lock-closed';
+      case 'fan': return 'hardware-chip';
       case 'curtain': return 'apps';
-      case 'charging-outlet': return 'battery-charging';
       default: return 'power';
     }
+  };
+
+  const getStatusText = () => {
+    if (isOffline) return 'Offline';
+    if (isCurtain) return isOn ? 'Open (90°)' : 'Closed';
+    return isOn ? `On • ${device.powerUsage || 60}W` : 'Off';
   };
 
   return (
@@ -42,7 +47,7 @@ export function DeviceCard({ device, onToggle }: DeviceCardProps) {
         isOffline && styles.cardOffline
       ]}
       activeOpacity={0.7}
-      onPress={() => router.push({ pathname: '/device/[id]', params: { id: device.id, classroomId: device.controllerId.replace('ctrl-', 'cls-') } })}
+      onPress={() => router.push({ pathname: '/device/[id]', params: { id: device.id, classroomId: targetClassroomId } })}
     >
       <View style={styles.header}>
         <View style={[
@@ -71,7 +76,7 @@ export function DeviceCard({ device, onToggle }: DeviceCardProps) {
           {device.name}
         </Text>
         <Text style={styles.status}>
-          {isOffline ? 'Offline' : isOn ? `${device.powerUsage}W` : 'Off'}
+          {getStatusText()}
         </Text>
       </View>
     </TouchableOpacity>

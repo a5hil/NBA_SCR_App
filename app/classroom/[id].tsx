@@ -10,7 +10,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 export default function ClassroomDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { classrooms, toggleDevice } = useApp();
+  const { classrooms, toggleDevice, openEsp32WebConsole, esp32Connected, esp32Ip } = useApp();
   const router = useRouter();
 
   const classroom = classrooms.find(c => c.id === id);
@@ -29,6 +29,7 @@ export default function ClassroomDetailScreen() {
   const isOffline = classroom.status === 'offline';
   const isOccupied = classroom.occupancy === 'occupied';
   const activeCount = classroom.devices.filter(d => d.status === 'on').length;
+  const isEsp32Controlled = classroom.id.includes('101') || classroom.id.includes('102');
 
   return (
     <View style={styles.container}>
@@ -36,7 +37,10 @@ export default function ClassroomDetailScreen() {
         title={classroom.name} 
         showBack 
         rightElement={
-          <TouchableOpacity style={styles.iconButton}>
+          <TouchableOpacity 
+            style={styles.iconButton}
+            onPress={() => router.push('/(tabs)/settings')}
+          >
             <Ionicons name="settings-outline" size={24} color={Colors.text} />
           </TouchableOpacity>
         }
@@ -65,7 +69,25 @@ export default function ClassroomDetailScreen() {
           </View>
         </View>
 
-        {isOffline && (
+        {/* ESP32 Hardware Console Quick Launcher */}
+        {isEsp32Controlled && (
+          <TouchableOpacity 
+            style={styles.hardwareBanner}
+            onPress={openEsp32WebConsole}
+            activeOpacity={0.8}
+          >
+            <View style={styles.hardwareLeft}>
+              <View style={[styles.hardwareDot, { backgroundColor: esp32Connected ? Colors.success : Colors.warning }]} />
+              <View>
+                <Text style={styles.hardwareTitle}>ESP32 Controller ({esp32Connected ? 'Live' : 'Standby'})</Text>
+                <Text style={styles.hardwareSubtitle}>Tap to launch ESP32 Web App • {esp32Ip}</Text>
+              </View>
+            </View>
+            <Ionicons name="open-outline" size={20} color={Colors.primary} />
+          </TouchableOpacity>
+        )}
+
+        {isOffline && !isEsp32Controlled && (
           <View style={styles.offlineBanner}>
             <Ionicons name="warning" size={24} color={Colors.critical} />
             <View style={styles.offlineTextContainer}>
@@ -77,16 +99,14 @@ export default function ClassroomDetailScreen() {
 
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Devices ({activeCount}/{classroom.devices.length} On)</Text>
-          <TouchableOpacity onPress={() => router.push('/add-device')}>
-            <Ionicons name="add-circle-outline" size={24} color={Colors.primary} />
-          </TouchableOpacity>
         </View>
 
         <View style={styles.deviceGrid}>
           {classroom.devices.map(device => (
             <DeviceCard 
               key={device.id} 
-              device={device} 
+              device={device}
+              classroomId={classroom.id}
               onToggle={() => toggleDevice(classroom.id, device.id)} 
             />
           ))}
@@ -161,6 +181,38 @@ const styles = StyleSheet.create({
     borderRadius: Layout.radius.md,
     marginBottom: 24,
     gap: 12,
+  },
+  hardwareBanner: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(253, 168, 58, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(253, 168, 58, 0.3)',
+    padding: 14,
+    borderRadius: Layout.radius.md,
+    marginBottom: 24,
+  },
+  hardwareLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    flex: 1,
+  },
+  hardwareDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+  },
+  hardwareTitle: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  hardwareSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    marginTop: 2,
   },
   offlineTextContainer: {
     flex: 1,

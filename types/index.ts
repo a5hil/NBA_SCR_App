@@ -140,3 +140,36 @@ export interface Campus {
   department: string;
   buildings: string[];
 }
+
+export interface ESP32Telemetry {
+  ip: string;
+  mode: 'auto' | 'manual';
+  temperature: number;
+  humidity: number;
+  totalLoadWatts: number;
+  rssi?: number;
+  uptimeSec?: number;
+  firmware?: string;
+  c1: {
+    occupied: boolean;
+    light: boolean;
+    fan: boolean;
+    curtain: boolean;
+    curtainAngle: number;
+    loadWatts: number;
+  };
+  c2: {
+    occupied: boolean;
+    light: boolean;
+    fan: boolean;
+    curtain: boolean;
+    curtainAngle: number;
+    loadWatts: number;
+  };
+  corridors: {
+    ldr1Raw: number;
+    ldr2Raw: number;
+    light1: boolean;
+    light2: boolean;
+  };
+}

@@ -26,8 +26,6 @@ export default function RootLayout() {
           <Stack.Screen name="classroom/[id]" />
           <Stack.Screen name="device/[id]" />
           <Stack.Screen name="notifications" options={{ animation: 'slide_from_right' }} />
-          <Stack.Screen name="add-classroom" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
-          <Stack.Screen name="add-device" options={{ presentation: 'modal', animation: 'slide_from_bottom' }} />
         </Stack>
         <ToastRenderer />
       </SafeAreaProvider>

@@ -44,7 +44,7 @@ export function FloatingBottomNav({ state, descriptors, navigation }: FloatingBo
         intensity={Platform.OS === 'ios' ? 80 : 100}
         tint="dark"
         style={[styles.blurContainer, { width: navWidth }]}
-        experimentalBlurMethod="dimezisBlurView"
+        blurMethod="none"
       >
         <View style={styles.navContent}>
           {state.routes.map((route, index) => {

@@ -32,7 +32,7 @@ function extractSettings(dev: { [k: string]: unknown }): Record<string, unknown>
 }
 
 async function clearAll(): Promise<void> {
-  for (const t of ['devices', 'controllers', 'activity', 'alerts', 'notifications', 'campuses']) {
+  for (const t of ['devices', 'controllers', 'activity', 'alerts', 'notifications', 'classrooms', 'campuses']) {
     const { error } = await supabase.from(t).delete().neq('id', '00000000-0000-0000-0000-000000000000');
     if (error) throw new Error(`clear ${t}: ${error.message}`);
   }
