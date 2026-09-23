@@ -1,5 +1,4 @@
 import React, { createContext, useContext, useState, useCallback, useEffect, useRef, ReactNode } from 'react';
-import { Linking } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import {
@@ -43,8 +42,8 @@ interface AppContextType {
   markAllNotificationsRead: () => void;
   deleteNotification: (id: string) => void;
   dismissAlert: (id: string) => void;
-  resetData: () => void;
   updateDeviceValue: (classroomId: string, deviceId: string, updates: Partial<Device>) => void;
+  updateDeviceRatedPower: (classroomId: string, deviceId: string, ratedWatts: number) => Promise<void>;
   esp32Ip: string;
   setEsp32Ip: (ip: string) => Promise<void>;
   esp32Connected: boolean;
@@ -52,7 +51,6 @@ interface AppContextType {
   systemMode: 'auto' | 'manual';
   setSystemMode: (mode: 'auto' | 'manual') => Promise<void>;
   syncWithEsp32: () => Promise<boolean>;
-  openEsp32WebConsole: () => void;
   toggleEsp32Mode: () => Promise<void>;
 }
 
@@ -164,13 +162,20 @@ function mapController(row: ControllerRow): Controller {
 }
 
 function mapDevice(row: DeviceRow): Device {
+  const defaultRated = row.category === 'fan' ? 75 : row.category === 'light' ? 60 : 40;
+  const settings = (row.settings as Record<string, unknown>) || {};
+  const rated = typeof settings.ratedPower === 'number'
+    ? settings.ratedPower
+    : (row.power_usage > 0 ? row.power_usage : defaultRated);
   return {
     id: row.id, name: row.name, category: row.category as DeviceCategory,
     status: row.status as DeviceStatus, controllerId: row.controller_id,
     relayChannel: row.relay_channel, roomArea: row.room_area,
     capabilities: (row.capabilities as DeviceCapability | null) ?? { power: true },
-    powerUsage: row.power_usage, energyToday: row.energy_today, lastUpdated: row.last_updated,
-    ...(row.settings ?? {}),
+    powerUsage: row.status === 'on' ? rated : 0,
+    ratedPower: rated,
+    energyToday: row.energy_today, lastUpdated: row.last_updated,
+    ...settings,
   };
 }
 
@@ -231,20 +236,25 @@ function buildClassrooms(
     activityByClass.set(r.classroom_id, list);
   }
 
-  return classroomRows.map((r) => ({
-    id: r.id, name: r.name, number: r.room_number, department: r.department,
-    building: r.building, floor: r.floor, capacity: r.capacity,
-    occupancy: r.occupancy_status as OccupancyStatus, status: r.status as ClassroomStatus,
-    temperature: r.temperature, currentLoad: r.current_load, energyToday: r.energy_today,
-    estimatedCost: r.estimated_cost,
-    controller: controllersByClass.get(r.id) ?? {
-      id: '', name: '', type: '', status: 'offline', signalStrength: 'weak',
-      relayChannels: 8, usedChannels: [], ipAddress: '', firmwareVersion: '', lastSeen: new Date().toISOString(),
-    },
-    devices: devicesByClass.get(r.id) ?? [],
-    alerts: alertsByClass.get(r.id) ?? [],
-    recentActivity: activityByClass.get(r.id) ?? [],
-  }));
+  return classroomRows.map((r) => {
+    const devs = devicesByClass.get(r.id) ?? [];
+    const activeDevLoad = devs.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+    const initialLoad = r.id === 'cls-a101' ? (r.current_load || activeDevLoad) : activeDevLoad;
+    return {
+      id: r.id, name: r.name, number: r.room_number, department: r.department,
+      building: r.building, floor: r.floor, capacity: r.capacity,
+      occupancy: r.occupancy_status as OccupancyStatus, status: r.status as ClassroomStatus,
+      temperature: r.temperature, currentLoad: initialLoad, energyToday: r.energy_today,
+      estimatedCost: r.estimated_cost,
+      controller: controllersByClass.get(r.id) ?? {
+        id: '', name: '', type: '', status: 'offline', signalStrength: 'weak',
+        relayChannels: 8, usedChannels: [], ipAddress: '', firmwareVersion: '', lastSeen: new Date().toISOString(),
+      },
+      devices: devs,
+      alerts: alertsByClass.get(r.id) ?? [],
+      recentActivity: activityByClass.get(r.id) ?? [],
+    };
+  });
 }
 
 export function AppProvider({ children }: { children: ReactNode }) {
@@ -252,6 +262,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [classrooms, setClassrooms] = useState<Classroom[]>(mockClassrooms);
   const [alerts, setAlerts] = useState<Alert[]>(mockAlerts);
   const [notifications, setNotifications] = useState<NotificationItem[]>(mockNotifications);
+  const [energyData, setEnergyData] = useState(mockEnergyData);
   const [quickControls, setQuickControls] = useState<QuickControls>({
     allLights: false, allFans: false, allCurtains: false,
   });
@@ -265,19 +276,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [esp32Telemetry, setEsp32Telemetry] = useState<ESP32Telemetry | null>(null);
   const [systemMode, setSystemModeState] = useState<'auto' | 'manual'>('manual');
   const isLanReachableRef = useRef<boolean>(false);
+  const lastModeToggleRef = useRef<number>(0);
 
   const setEsp32Ip = useCallback(async (ip: string) => {
     setEsp32IpState(ip);
     await AsyncStorage.setItem(STORAGE_KEYS.ESP32_IP, ip).catch(console.error);
   }, []);
-
-  const openEsp32WebConsole = useCallback(() => {
-    if (!esp32Ip) return;
-    const url = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
-    Linking.openURL(url).catch(err => {
-      console.error('Failed to open ESP32 web portal:', err);
-    });
-  }, [esp32Ip]);
 
   const loadFromSupabase = useCallback(async (): Promise<boolean> => {
     if (!isSupabaseConfigured) return false;
@@ -410,25 +414,41 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const newRecord = payload.new;
           if (newRecord && newRecord.id) {
             if (newRecord.id === 'dev-system-mode') {
-              if (newRecord.status === 'auto' || newRecord.status === 'manual') {
-                setSystemModeState(newRecord.status);
+              if (Date.now() - lastModeToggleRef.current > 10000) {
+                if (newRecord.status === 'auto' || newRecord.status === 'manual') {
+                  setSystemModeState(newRecord.status);
+                }
               }
               return;
             }
             setClassrooms(prev => prev.map(cls => {
               if (cls.id !== newRecord.classroom_id) return cls;
+              const updatedDevices = cls.devices.map(dev => {
+                if (dev.id !== newRecord.id) return dev;
+                const newSettings = (newRecord.settings as Record<string, unknown>) || {};
+                const rated = typeof newSettings.ratedPower === 'number'
+                  ? newSettings.ratedPower
+                  : (dev.ratedPower || (newRecord.power_usage > 0 ? newRecord.power_usage : (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40)));
+                const isOn = newRecord.status === 'on';
+                return {
+                  ...dev,
+                  status: newRecord.status as DeviceStatus,
+                  ratedPower: rated,
+                  powerUsage: isOn ? rated : 0,
+                  capabilities: newRecord.capabilities ?? dev.capabilities,
+                  lastUpdated: newRecord.last_updated ?? new Date().toISOString()
+                };
+              });
+
+              const hasPhysicalSensor = cls.hasPowerMeter && cls.voltage && cls.voltage >= 60 && cls.current && cls.current >= 0.09;
+              const newLoad = hasPhysicalSensor
+                ? cls.currentLoad
+                : updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+
               return {
                 ...cls,
-                devices: cls.devices.map(dev => {
-                  if (dev.id !== newRecord.id) return dev;
-                  return {
-                    ...dev,
-                    status: newRecord.status as DeviceStatus,
-                    powerUsage: newRecord.power_usage,
-                    capabilities: newRecord.capabilities ?? dev.capabilities,
-                    lastUpdated: newRecord.last_updated ?? new Date().toISOString()
-                  };
-                })
+                currentLoad: newLoad,
+                devices: updatedDevices,
               };
             }));
           }
@@ -442,11 +462,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
           if (newRecord && newRecord.id) {
             setClassrooms(prev => prev.map(cls => {
               if (cls.id !== newRecord.id) return cls;
+              const hasPhysicalSensor = cls.hasPowerMeter && cls.voltage && cls.voltage >= 60 && cls.current && cls.current >= 0.09;
+              const activeDeviceLoad = cls.devices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
               return {
                 ...cls,
                 occupancy: (newRecord.occupancy_status as 'occupied' | 'vacant') || cls.occupancy,
                 temperature: typeof newRecord.temperature === 'number' ? newRecord.temperature : cls.temperature,
-                currentLoad: typeof newRecord.current_load === 'number' ? newRecord.current_load : cls.currentLoad,
+                currentLoad: hasPhysicalSensor
+                  ? (typeof newRecord.current_load === 'number' ? newRecord.current_load : cls.currentLoad)
+                  : activeDeviceLoad,
                 status: (newRecord.status as 'online' | 'offline') || cls.status,
               };
             }));
@@ -495,7 +519,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!esp32Ip || esp32Ip.trim() === '') return false;
     const baseUrl = esp32Ip.startsWith('http') ? esp32Ip.trim() : `http://${esp32Ip.trim()}`;
     const controller = new AbortController();
-    const timeoutMs = isLanReachableRef.current ? 1800 : 900;
+    const timeoutMs = isLanReachableRef.current ? 3500 : 2500;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
@@ -507,13 +531,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setEsp32Connected(true);
       const telemetry: ESP32Telemetry = {
         ip: data.controller?.ip || esp32Ip,
-        mode: data.mode || 'auto',
+        mode: (data.mode === 'auto' || data.mode === 'manual') ? data.mode : systemMode,
         temperature: Number(data.temperature) || 24,
         humidity: Number(data.humidity) || 50,
         totalLoadWatts: Number(data.total_load_watts) || 0,
         rssi: data.controller?.rssi,
         uptimeSec: data.controller?.uptime_sec,
-        firmware: data.controller?.firmware || '2.2.0',
+        firmware: data.controller?.firmware || '2.4.0',
+        hourlyEnergy: Array.isArray(data.hourly_energy) ? data.hourly_energy.map(Number) : undefined,
         c1: {
           occupied: Boolean(data.classroom1?.occupied),
           light: Boolean(data.classroom1?.light),
@@ -521,6 +546,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
           curtain: Boolean(data.classroom1?.curtain),
           curtainAngle: Number(data.classroom1?.curtain_angle) || 0,
           loadWatts: Number(data.classroom1?.load_watts) || 0,
+          voltage: data.classroom1?.voltage !== undefined ? Number(data.classroom1.voltage) : 0,
+          current: data.classroom1?.current !== undefined ? Number(data.classroom1.current) : 0,
+          hasPowerMeter: true,
+          energyToday: data.classroom1?.energy_today !== undefined ? Number(data.classroom1.energy_today) : undefined,
+          estimatedCost: data.classroom1?.estimated_cost !== undefined ? Number(data.classroom1.estimated_cost) : undefined,
         },
         c2: {
           occupied: Boolean(data.classroom2?.occupied),
@@ -529,6 +559,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
           curtain: Boolean(data.classroom2?.curtain),
           curtainAngle: Number(data.classroom2?.curtain_angle) || 0,
           loadWatts: Number(data.classroom2?.load_watts) || 0,
+          voltage: 0,
+          current: 0,
+          hasPowerMeter: false,
+          energyToday: data.classroom2?.energy_today !== undefined ? Number(data.classroom2.energy_today) : undefined,
+          estimatedCost: data.classroom2?.estimated_cost !== undefined ? Number(data.classroom2.estimated_cost) : undefined,
         },
         corridors: {
           ldr1Raw: Number(data.corridors?.ldr1_raw) || 0,
@@ -538,19 +573,62 @@ export function AppProvider({ children }: { children: ReactNode }) {
         },
       };
       setEsp32Telemetry(telemetry);
-      if (telemetry.mode === 'auto' || telemetry.mode === 'manual') {
-        setSystemModeState(telemetry.mode);
+      if (Date.now() - lastModeToggleRef.current > 10000) {
+        if (telemetry.mode === 'auto' || telemetry.mode === 'manual') {
+          setSystemModeState(telemetry.mode);
+        }
+      }
+
+      // Update Live Consumption Chart from ESP32 Real-Time Hourly Readings
+      if (Array.isArray(telemetry.hourlyEnergy) && telemetry.hourlyEnergy.length === 24) {
+        setEnergyData(prev => ({
+          ...prev,
+          hourly: telemetry.hourlyEnergy!.map((val, i) => ({
+            time: `${i.toString().padStart(2, '0')}:00`,
+            value: Math.max(0, Number(val.toFixed(3))),
+          })),
+        }));
       }
 
       // Reflect hardware states into Classroom models
       setClassrooms(prev => prev.map(cls => {
-        // Classroom A101 (Classroom 1)
+        // Classroom A101 (Classroom 1) - Connected to ACS712 & ZMPT101B
         if (cls.id === 'cls-a101' || cls.id.includes('101')) {
+          const liveKwh = telemetry.c1.energyToday !== undefined ? telemetry.c1.energyToday : cls.energyToday;
+          const liveCost = telemetry.c1.estimatedCost !== undefined ? telemetry.c1.estimatedCost : (liveKwh * 8.0);
+          const updatedDevices = cls.devices.map(dev => {
+            const rated = dev.ratedPower || (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40);
+            if (dev.category === 'light') {
+              const isOn = telemetry.c1.light;
+              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+            }
+            if (dev.category === 'fan') {
+              const isOn = telemetry.c1.fan;
+              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+            }
+            if (dev.category === 'curtain') {
+              const isOn = telemetry.c1.curtain;
+              const cRated = dev.ratedPower || 5;
+              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: cRated, powerUsage: isOn ? cRated : 0 };
+            }
+            return dev;
+          });
+
+          // Use real physical measurement IF AC line is connected and active; otherwise sum active rated devices
+          const hasRealAC = (telemetry.c1.voltage ?? 0) >= 60.0 && (telemetry.c1.current ?? 0) >= 0.09 && (telemetry.c1.loadWatts ?? 0) > 0.5;
+          const activeDeviceWatts = updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+          const c1Load = hasRealAC ? telemetry.c1.loadWatts : activeDeviceWatts;
+
           return {
             ...cls,
             temperature: telemetry.temperature,
             occupancy: telemetry.c1.occupied ? 'occupied' : 'vacant',
-            currentLoad: telemetry.c1.loadWatts,
+            currentLoad: c1Load,
+            voltage: telemetry.c1.voltage ?? 0,
+            current: telemetry.c1.current ?? 0,
+            energyToday: liveKwh,
+            estimatedCost: liveCost,
+            hasPowerMeter: true,
             status: 'online',
             controller: {
               ...cls.controller,
@@ -559,31 +637,45 @@ export function AppProvider({ children }: { children: ReactNode }) {
               signalStrength: (telemetry.rssi && telemetry.rssi > -60) ? 'strong' : (telemetry.rssi && telemetry.rssi > -75) ? 'medium' : 'weak',
               lastSeen: new Date().toISOString(),
             },
-            devices: cls.devices.map(dev => {
-              if (dev.category === 'light') {
-                const isOn = telemetry.c1.light;
-                return { ...dev, status: isOn ? 'on' : 'off', powerUsage: isOn ? (dev.powerUsage || 60) : 0 };
-              }
-              if (dev.category === 'fan') {
-                const isOn = telemetry.c1.fan;
-                return { ...dev, status: isOn ? 'on' : 'off', powerUsage: isOn ? (dev.powerUsage || 75) : 0 };
-              }
-              if (dev.category === 'curtain') {
-                const isOn = telemetry.c1.curtain;
-                return { ...dev, status: isOn ? 'on' : 'off' };
-              }
-              return dev;
-            }),
+            devices: updatedDevices,
           };
         }
 
-        // Classroom A102 (Classroom 2)
+        // Classroom A102 (Classroom 2) - Standard setup (No Power Meter)
         if (cls.id === 'cls-a102' || cls.id.includes('102')) {
+          const liveKwh = telemetry.c2.energyToday !== undefined ? telemetry.c2.energyToday : cls.energyToday;
+          const liveCost = telemetry.c2.estimatedCost !== undefined ? telemetry.c2.estimatedCost : (liveKwh * 8.0);
+          const updatedDevices = cls.devices.map(dev => {
+            const rated = dev.ratedPower || (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40);
+            if (dev.category === 'light') {
+              const isOn = telemetry.c2.light;
+              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+            }
+            if (dev.category === 'fan') {
+              const isOn = telemetry.c2.fan;
+              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+            }
+            if (dev.category === 'curtain') {
+              const isOn = telemetry.c2.curtain;
+              const cRated = dev.ratedPower || 5;
+              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: cRated, powerUsage: isOn ? cRated : 0 };
+            }
+            return dev;
+          });
+
+          // Dynamic rated power sum based on user specifications
+          const c2Load = updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+
           return {
             ...cls,
             temperature: telemetry.temperature,
             occupancy: telemetry.c2.occupied ? 'occupied' : 'vacant',
-            currentLoad: telemetry.c2.loadWatts,
+            currentLoad: c2Load,
+            voltage: 0,
+            current: 0,
+            energyToday: liveKwh,
+            estimatedCost: liveCost,
+            hasPowerMeter: false,
             status: 'online',
             controller: {
               ...cls.controller,
@@ -592,36 +684,27 @@ export function AppProvider({ children }: { children: ReactNode }) {
               signalStrength: (telemetry.rssi && telemetry.rssi > -60) ? 'strong' : (telemetry.rssi && telemetry.rssi > -75) ? 'medium' : 'weak',
               lastSeen: new Date().toISOString(),
             },
-            devices: cls.devices.map(dev => {
-              if (dev.category === 'light') {
-                const isOn = telemetry.c2.light;
-                return { ...dev, status: isOn ? 'on' : 'off', powerUsage: isOn ? (dev.powerUsage || 60) : 0 };
-              }
-              if (dev.category === 'fan') {
-                const isOn = telemetry.c2.fan;
-                return { ...dev, status: isOn ? 'on' : 'off', powerUsage: isOn ? (dev.powerUsage || 75) : 0 };
-              }
-              if (dev.category === 'curtain') {
-                const isOn = telemetry.c2.curtain;
-                return { ...dev, status: isOn ? 'on' : 'off' };
-              }
-              return dev;
-            }),
+            devices: updatedDevices,
           };
         }
 
-        // Corridors & Hallways (Corridor Zone)
+        // Corridors & Hallways (Corridor Zone) - Standard setup (No Power Meter)
         if (cls.id === 'cls-corridor' || cls.id.includes('corr')) {
-          const corLoad = (telemetry.corridors.light1 ? 40 : 0) + (telemetry.corridors.light2 ? 40 : 0);
+          const updatedDevices = cls.devices.map(dev => {
+            const isDev1 = dev.id.includes('1');
+            const isOn = isDev1 ? telemetry.corridors.light1 : telemetry.corridors.light2;
+            const rated = dev.ratedPower || 40;
+            return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+          });
+          const corLoad = updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
           return {
             ...cls,
             currentLoad: corLoad,
+            voltage: 0,
+            current: 0,
+            hasPowerMeter: false,
             status: 'online',
-            devices: cls.devices.map(dev => {
-              const isDev1 = dev.id.includes('1');
-              const isOn = isDev1 ? telemetry.corridors.light1 : telemetry.corridors.light2;
-              return { ...dev, status: isOn ? 'on' : 'off', powerUsage: isOn ? (dev.powerUsage || 40) : 0 };
-            }),
+            devices: updatedDevices,
           };
         }
 
@@ -639,7 +722,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         try {
           const [ctrlRes, devRes, clsRes] = await Promise.all([
             supabase.from('controllers').select('status, ip_address').eq('id', 'ctrl-esp32').single(),
-            supabase.from('devices').select('id, classroom_id, status, power_usage, last_updated'),
+            supabase.from('devices').select('id, classroom_id, status, power_usage, settings, energy_today, last_updated'),
             supabase.from('classrooms').select('id, temperature, occupancy_status, current_load, status'),
           ]);
 
@@ -651,27 +734,44 @@ export function AppProvider({ children }: { children: ReactNode }) {
           }
 
           if (devRes.data && devRes.data.length > 0) {
-            const modeDev = devRes.data.find(d => d.id === 'dev-system-mode');
-            if (modeDev && (modeDev.status === 'auto' || modeDev.status === 'manual')) {
-              setSystemModeState(modeDev.status);
+            if (Date.now() - lastModeToggleRef.current > 10000) {
+              const modeDev = devRes.data.find(d => d.id === 'dev-system-mode');
+              if (modeDev && (modeDev.status === 'auto' || modeDev.status === 'manual')) {
+                setSystemModeState(modeDev.status);
+              }
             }
             const devMap = new Map(devRes.data.map(d => [d.id, d]));
-            setClassrooms(prev => prev.map(cls => ({
-              ...cls,
-              devices: cls.devices.map(dev => {
+            setClassrooms(prev => prev.map(cls => {
+              const updatedDevices = cls.devices.map(dev => {
                 const cloudDev = devMap.get(dev.id);
                 if (!cloudDev) return dev;
                 // Protect recent optimistic toggle from being overwritten by in-flight cloud sync
                 const localUpdated = dev.lastUpdated ? new Date(dev.lastUpdated).getTime() : 0;
                 if (Date.now() - localUpdated < 4000) return dev;
+                const cloudSettings = (cloudDev.settings as Record<string, unknown>) || {};
+                const rated = typeof cloudSettings.ratedPower === 'number'
+                  ? cloudSettings.ratedPower
+                  : (dev.ratedPower || (cloudDev.power_usage > 0 ? cloudDev.power_usage : (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40)));
+                const isOn = cloudDev.status === 'on';
                 return {
                   ...dev,
                   status: cloudDev.status as DeviceStatus,
-                  powerUsage: cloudDev.power_usage ?? dev.powerUsage,
+                  ratedPower: rated,
+                  powerUsage: isOn ? rated : 0,
+                  energyToday: typeof cloudDev.energy_today === 'number' ? cloudDev.energy_today : dev.energyToday,
                   lastUpdated: cloudDev.last_updated || dev.lastUpdated,
                 };
-              }),
-            })));
+              });
+
+              const hasPhysicalSensor = cls.hasPowerMeter && cls.voltage && cls.voltage >= 60 && cls.current && cls.current >= 0.09;
+              const computedLoad = updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+
+              return {
+                ...cls,
+                currentLoad: hasPhysicalSensor ? cls.currentLoad : computedLoad,
+                devices: updatedDevices,
+              };
+            }));
           }
 
           if (clsRes.data && clsRes.data.length > 0) {
@@ -679,11 +779,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
             setClassrooms(prev => prev.map(cls => {
               const cloudCls = clsMap.get(cls.id);
               if (!cloudCls) return cls;
+              const hasPhysicalSensor = cls.hasPowerMeter && cls.voltage && cls.voltage >= 60 && cls.current && cls.current >= 0.09;
+              const activeDeviceLoad = cls.devices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
               return {
                 ...cls,
                 occupancy: (cloudCls.occupancy_status as 'occupied' | 'vacant') || cls.occupancy,
                 temperature: typeof cloudCls.temperature === 'number' ? cloudCls.temperature : cls.temperature,
-                currentLoad: typeof cloudCls.current_load === 'number' ? cloudCls.current_load : cls.currentLoad,
+                currentLoad: hasPhysicalSensor
+                  ? (typeof cloudCls.current_load === 'number' ? cloudCls.current_load : cls.currentLoad)
+                  : activeDeviceLoad,
                 status: (cloudCls.status as 'online' | 'offline') || cls.status,
               };
             }));
@@ -702,28 +806,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [esp32Ip]);
 
   const setSystemMode = useCallback(async (mode: 'auto' | 'manual') => {
+    lastModeToggleRef.current = Date.now();
     setSystemModeState(mode);
     await AsyncStorage.setItem(STORAGE_KEYS.SYSTEM_MODE, mode).catch(console.error);
 
     // 1. FAST LAN PATH (if connected on local Wi-Fi)
-    if (esp32Ip && esp32Telemetry) {
+    if (esp32Ip && esp32Ip.trim() !== '') {
       const cleanIp = esp32Ip.trim();
       const baseUrl = cleanIp.startsWith('http') ? cleanIp : `http://${cleanIp}`;
-      void fetch(`${baseUrl}/mode?auto=${mode === 'auto' ? 1 : 0}`).catch(() => {});
+      try {
+        const lanController = new AbortController();
+        const lanTimeout = setTimeout(() => lanController.abort(), 2000);
+        await fetch(`${baseUrl}/mode?auto=${mode === 'auto' ? 1 : 0}`, { signal: lanController.signal });
+        clearTimeout(lanTimeout);
+      } catch {
+        // LAN failed or on remote network, Supabase path will handle
+      }
     }
 
     // 2. SUPABASE CLOUD PATH (Works on 4G/5G mobile data + syncs all remote apps)
     if (isSupabaseConfigured) {
-      void supabase.from('devices')
-        .update({ status: mode, last_updated: new Date().toISOString() })
-        .eq('id', 'dev-system-mode')
-        .then(({ error }) => {
-          if (error) console.error('SYSTEM MODE SYNC FAILED:', error.message);
-        });
+      try {
+        const { error } = await supabase.from('devices')
+          .update({ status: mode, last_updated: new Date().toISOString() })
+          .eq('id', 'dev-system-mode');
+        if (error) console.error('SYSTEM MODE SYNC FAILED:', error.message);
+      } catch (e) {
+        console.error('SYSTEM MODE EXCEPTION:', e);
+      }
     }
 
     showToast(`Switched to ${mode.toUpperCase()} Mode`, 'info');
-  }, [esp32Ip, esp32Telemetry, showToast]);
+  }, [esp32Ip, showToast]);
 
   const toggleEsp32Mode = useCallback(async () => {
     const nextMode = systemMode === 'auto' ? 'manual' : 'auto';
@@ -737,9 +851,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     const nextState = targetDev.status !== 'on';
     const newStatus: DeviceStatus = nextState ? 'on' : 'off';
-    const powerUsage = nextState ? (targetDev.powerUsage || 60) : 0;
+    const rated = targetDev.ratedPower || (targetDev.category === 'fan' ? 75 : targetDev.category === 'light' ? 60 : 40);
+    const powerUsage = nextState ? rated : 0;
     const deviceName = targetDev.name;
     const effectiveIp = esp32Ip || targetClass?.controller?.ipAddress;
+    let newClsLoad = 0;
 
     // 1. FAST PATH: Dispatch command directly to ESP32 hardware immediately (<5ms!) if on LAN
     if (effectiveIp && esp32Telemetry) {
@@ -750,22 +866,42 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // 2. Optimistic local React state update
     setClassrooms(prev => prev.map(cls => {
       if (cls.id !== classroomId) return cls;
+      const updatedDevices = cls.devices.map(dev => {
+        if (dev.id !== deviceId) return dev;
+        return {
+          ...dev,
+          status: newStatus,
+          ratedPower: rated,
+          powerUsage,
+          lastUpdated: new Date().toISOString(),
+        };
+      });
+
+      const hasPhysicalSensor = cls.hasPowerMeter && cls.voltage && cls.voltage >= 60 && cls.current && cls.current >= 0.09;
+      newClsLoad = hasPhysicalSensor 
+        ? cls.currentLoad 
+        : updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+
       return {
         ...cls,
-        devices: cls.devices.map(dev => {
-          if (dev.id !== deviceId) return dev;
-          return {
-            ...dev,
-            status: newStatus,
-            powerUsage,
-            lastUpdated: new Date().toISOString(),
-          };
-        }),
+        currentLoad: newClsLoad,
+        devices: updatedDevices,
       };
     }));
 
-    // 3. Asynchronous cloud persistence in background
-    void syncDevices([{ id: deviceId, data: { status: newStatus, power_usage: powerUsage } }]);
+    // 3. Asynchronous cloud persistence in background - preserve ratedPower in settings!
+    const existingSettings = deviceSettings(targetDev);
+    existingSettings.ratedPower = rated;
+    void syncDevices([{ 
+      id: deviceId, 
+      data: { 
+        status: newStatus, 
+        power_usage: powerUsage,
+        settings: existingSettings,
+      } 
+    }]);
+
+    void supabase.from('classrooms').update({ current_load: newClsLoad }).eq('id', classroomId);
 
     // 4. Manual override disarms Auto Mode so sensors don't fight user commands
     if (systemMode === 'auto') {
@@ -793,21 +929,108 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (settings) void syncDevices([{ id: deviceId, data: { settings } }]);
   }, [syncDevices]);
 
+  const updateDeviceRatedPower = useCallback(async (classroomId: string, deviceId: string, ratedWatts: number) => {
+    let updatedLoad = 0;
+    let targetDeviceCategory = '';
+    let targetSettings: Record<string, unknown> = {};
+
+    setClassrooms(prev => prev.map(cls => {
+      if (cls.id !== classroomId) return cls;
+      const updatedDevices = cls.devices.map(dev => {
+        if (dev.id !== deviceId) return dev;
+        targetDeviceCategory = dev.category;
+        targetSettings = { ...deviceSettings(dev), ratedPower: ratedWatts };
+        const isOn = dev.status === 'on';
+        return {
+          ...dev,
+          ratedPower: ratedWatts,
+          powerUsage: isOn ? ratedWatts : 0,
+          settings: targetSettings,
+          lastUpdated: new Date().toISOString(),
+        };
+      });
+
+      const hasPhysicalSensor = cls.hasPowerMeter && cls.voltage && cls.voltage >= 60 && cls.current && cls.current >= 0.09;
+      updatedLoad = hasPhysicalSensor 
+        ? cls.currentLoad 
+        : updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+
+      return {
+        ...cls,
+        currentLoad: updatedLoad,
+        devices: updatedDevices,
+      };
+    }));
+
+    // Persist to Supabase devices table (store both power_usage and settings.ratedPower)
+    const { error: devErr } = await supabase
+      .from('devices')
+      .update({ 
+        power_usage: ratedWatts, 
+        settings: targetSettings,
+        last_updated: new Date().toISOString() 
+      })
+      .eq('id', deviceId);
+    if (devErr) console.error('Failed to persist rated power to Supabase:', devErr.message);
+
+    // Persist updated classroom current_load to Supabase classrooms table
+    const { error: clsErr } = await supabase
+      .from('classrooms')
+      .update({ current_load: updatedLoad })
+      .eq('id', classroomId);
+    if (clsErr) console.error('Failed to persist classroom current_load to Supabase:', clsErr.message);
+
+    // Also notify ESP32 if online so internal firmware load matches user customization
+    if (esp32Ip) {
+      try {
+        let paramName = '';
+        if (classroomId.includes('101')) {
+          if (targetDeviceCategory === 'light') paramName = 'c1_light_w';
+          else if (targetDeviceCategory === 'fan') paramName = 'c1_fan_w';
+        } else if (classroomId.includes('102')) {
+          if (targetDeviceCategory === 'light') paramName = 'c2_light_w';
+          else if (targetDeviceCategory === 'fan') paramName = 'c2_fan_w';
+        } else if (classroomId.includes('corr')) {
+          if (deviceId.includes('1')) paramName = 'corr1_w';
+          else paramName = 'corr2_w';
+        }
+        if (paramName) {
+          fetch(`http://${esp32Ip}/api/config?${paramName}=${ratedWatts}`, { method: 'GET' }).catch(() => {});
+        }
+      } catch {}
+    }
+
+    showToast(`Rated load updated to ${ratedWatts}W`, 'success');
+  }, [esp32Ip, showToast]);
+
   const toggleQuickControl = useCallback((control: keyof QuickControls) => {
     setQuickControls(prev => {
       const newState = !prev[control];
       const category = categoryMap[control];
-      const sync: { id: string; data: { status: DeviceStatus; power_usage: number } }[] = [];
-      setClassrooms(prevCls => prevCls.map(cls => ({
-        ...cls,
-        devices: cls.devices.map(dev => {
+      const sync: { id: string; data: Record<string, unknown> }[] = [];
+      setClassrooms(prevCls => prevCls.map(cls => {
+        const updatedDevices = cls.devices.map(dev => {
           if (dev.category !== category || dev.status === 'offline') return dev;
           const newStatus: DeviceStatus = newState ? 'on' : 'off';
-          const powerUsage = newStatus === 'off' ? 0 : (dev.powerUsage || 60);
-          sync.push({ id: dev.id, data: { status: newStatus, power_usage: powerUsage } });
-          return { ...dev, status: newStatus, powerUsage, lastUpdated: new Date().toISOString() };
-        }),
-      })));
+          const rated = dev.ratedPower || (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40);
+          const powerUsage = newStatus === 'off' ? 0 : rated;
+          const existingSettings = deviceSettings(dev);
+          existingSettings.ratedPower = rated;
+          sync.push({ id: dev.id, data: { status: newStatus, power_usage: powerUsage, settings: existingSettings } });
+          return { ...dev, status: newStatus, ratedPower: rated, powerUsage, lastUpdated: new Date().toISOString() };
+        });
+
+        const hasPhysicalSensor = cls.hasPowerMeter && cls.voltage && cls.voltage >= 60 && cls.current && cls.current >= 0.09;
+        const newLoad = hasPhysicalSensor 
+          ? cls.currentLoad 
+          : updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
+
+        return {
+          ...cls,
+          currentLoad: newLoad,
+          devices: updatedDevices,
+        };
+      }));
       if (sync.length) void syncDevices(sync);
 
       // Dispatch to ESP32
@@ -839,12 +1062,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [esp32Ip, setSystemMode, showToast, syncDevices, syncWithEsp32, systemMode]);
 
   const emergencyOff = useCallback(() => {
-    const sync: { id: string; data: { status: DeviceStatus; power_usage: number } }[] = [];
+    const sync: { id: string; data: Record<string, unknown> }[] = [];
     setClassrooms(prev => prev.map(cls => ({
       ...cls,
+      currentLoad: 0,
       devices: cls.devices.map(dev => {
         if (dev.status === 'offline') return dev;
-        sync.push({ id: dev.id, data: { status: 'off' as const, power_usage: 0 } });
+        const existingSettings = deviceSettings(dev);
+        existingSettings.ratedPower = dev.ratedPower;
+        sync.push({ id: dev.id, data: { status: 'off' as const, power_usage: 0, settings: existingSettings } });
         return {
           ...dev,
           status: 'off' as const,
@@ -855,6 +1081,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     })));
     setQuickControls({ allLights: false, allFans: false, allCurtains: false });
     if (sync.length) void syncDevices(sync);
+
+    // Also update Supabase classrooms current_load to 0
+    void supabase.from('classrooms').update({ current_load: 0 }).neq('id', '');
 
     // Hardware sync: Trigger emergency all-off on all connected ESP32 controllers
     if (esp32Ip) {
@@ -968,35 +1197,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const resetData = useCallback(() => {
-    void (async () => {
-      try {
-        await loadFromSupabase();
-      } catch (error) {
-        console.error('Failed to reload from Supabase', error);
-        setClassrooms(mockClassrooms);
-        setAlerts(mockAlerts);
-        setNotifications(mockNotifications);
-      }
-    })();
-    setQuickControls({ allLights: false, allFans: false, allCurtains: false });
-    AsyncStorage.clear().catch(console.error);
-  }, [loadFromSupabase]);
-
   if (!isReady) return null;
 
   return (
     <AppContext.Provider value={{
       user: mockUser, campus, classrooms, alerts, notifications,
-      energyData: mockEnergyData, quickControls, toast,
+      energyData, quickControls, toast,
       showToast, hideToast,
       toggleDevice, toggleQuickControl, emergencyOff,
       addClassroom, addDevice,
       markNotificationRead, markAllNotificationsRead, deleteNotification,
-      dismissAlert, resetData, updateDeviceValue,
+      dismissAlert, updateDeviceValue, updateDeviceRatedPower,
       esp32Ip, setEsp32Ip, esp32Connected, esp32Telemetry,
       systemMode, setSystemMode,
-      syncWithEsp32, openEsp32WebConsole, toggleEsp32Mode,
+      syncWithEsp32, toggleEsp32Mode,
     }}>
       {children}
     </AppContext.Provider>

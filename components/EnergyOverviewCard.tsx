@@ -35,12 +35,14 @@ export function EnergyOverviewCard() {
           <Text style={styles.cardTitle}>Today's Energy</Text>
         </View>
         <View style={styles.cardBody}>
-          <Text style={styles.energyValue}>{totalEnergy.toFixed(1)}</Text>
+          <Text style={styles.energyValue}>
+            {totalEnergy < 1 ? totalEnergy.toFixed(3) : totalEnergy.toFixed(2)}
+          </Text>
           <Text style={styles.energyUnit}>kWh</Text>
         </View>
         <View style={styles.cardFooter}>
-          <Ionicons name="trending-up" size={16} color="rgba(0,0,0,0.6)" />
-          <Text style={styles.footerText}>12% vs yesterday</Text>
+          <Ionicons name="hardware-chip-outline" size={15} color="rgba(0,0,0,0.7)" />
+          <Text style={styles.footerText}>Live hardware telemetry</Text>
         </View>
       </TouchableOpacity>
 
@@ -51,7 +53,9 @@ export function EnergyOverviewCard() {
           </View>
           <View style={styles.sideCardTextContainer}>
             <Text style={styles.sideCardLabel}>Current Load</Text>
-            <Text style={styles.sideCardValue}>{(totalLoad / 1000).toFixed(2)} kW</Text>
+            <Text style={styles.sideCardValue}>
+              {totalLoad < 1000 ? `${totalLoad.toFixed(0)} W` : `${(totalLoad / 1000).toFixed(2)} kW`}
+            </Text>
           </View>
         </View>
 

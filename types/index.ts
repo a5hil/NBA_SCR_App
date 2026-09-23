@@ -56,6 +56,7 @@ export interface Device {
   volume?: number;
   source?: string;
   powerUsage: number;
+  ratedPower?: number;
   energyToday: number;
   lastUpdated: string;
 }
@@ -87,6 +88,9 @@ export interface Classroom {
   currentLoad: number;
   energyToday: number;
   estimatedCost: number;
+  voltage?: number;
+  current?: number;
+  hasPowerMeter?: boolean;
   controller: Controller;
   devices: Device[];
   alerts: Alert[];
@@ -150,6 +154,7 @@ export interface ESP32Telemetry {
   rssi?: number;
   uptimeSec?: number;
   firmware?: string;
+  hourlyEnergy?: number[];
   c1: {
     occupied: boolean;
     light: boolean;
@@ -157,6 +162,11 @@ export interface ESP32Telemetry {
     curtain: boolean;
     curtainAngle: number;
     loadWatts: number;
+    voltage?: number;
+    current?: number;
+    hasPowerMeter?: boolean;
+    energyToday?: number;
+    estimatedCost?: number;
   };
   c2: {
     occupied: boolean;
@@ -165,6 +175,11 @@ export interface ESP32Telemetry {
     curtain: boolean;
     curtainAngle: number;
     loadWatts: number;
+    voltage?: number;
+    current?: number;
+    hasPowerMeter?: boolean;
+    energyToday?: number;
+    estimatedCost?: number;
   };
   corridors: {
     ldr1Raw: number;

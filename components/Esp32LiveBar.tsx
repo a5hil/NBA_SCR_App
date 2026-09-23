@@ -14,7 +14,6 @@ export function Esp32LiveBar() {
     systemMode,
     toggleEsp32Mode,
     syncWithEsp32, 
-    openEsp32WebConsole,
     showToast,
     classrooms,
   } = useApp();
@@ -111,40 +110,43 @@ export function Esp32LiveBar() {
         </View>
       )}
 
+      {/* Classroom A101 AC Power Meter Live Badge */}
+      {esp32Connected && esp32Telemetry?.c1.hasPowerMeter && esp32Telemetry.c1.voltage !== undefined && (
+        <View style={styles.a101MeterStrip}>
+          <Ionicons name="flash" size={13} color={Colors.primary} />
+          <Text style={styles.a101MeterText}>
+            <Text style={{ fontWeight: '700', color: Colors.text }}>A101 Meter: </Text>
+            {esp32Telemetry.c1.voltage.toFixed(0)}V • {esp32Telemetry.c1.current?.toFixed(2) || '0.00'}A • {esp32Telemetry.c1.loadWatts.toFixed(0)}W
+          </Text>
+        </View>
+      )}
+
       {/* Action Buttons */}
       <View style={styles.actionsRow}>
         <TouchableOpacity 
           style={styles.actionBtnPrimary}
-          onPress={openEsp32WebConsole}
-          activeOpacity={0.8}
-        >
-          <Ionicons name="open-outline" size={16} color="#000" />
-          <Text style={styles.actionBtnPrimaryText}>Launch Web App</Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity 
-          style={styles.actionBtnSecondary}
           onPress={handleManualSync}
           disabled={syncing}
           activeOpacity={0.8}
         >
           {syncing ? (
-            <ActivityIndicator size="small" color={Colors.primary} />
+            <ActivityIndicator size="small" color="#000" />
           ) : (
-            <Ionicons name="refresh" size={16} color={Colors.primary} />
+            <Ionicons name="refresh" size={16} color="#000" />
           )}
-          <Text style={styles.actionBtnSecondaryText}>Sync</Text>
+          <Text style={styles.actionBtnPrimaryText}>Sync Live State</Text>
         </TouchableOpacity>
 
         <TouchableOpacity 
-          style={styles.actionBtnIcon}
+          style={styles.actionBtnSecondary}
           onPress={() => {
             setInputIp(esp32Ip);
             setModalVisible(true);
           }}
           activeOpacity={0.8}
         >
-          <Ionicons name="settings-outline" size={16} color={Colors.textMuted} />
+          <Ionicons name="settings-outline" size={16} color={Colors.primary} />
+          <Text style={styles.actionBtnSecondaryText}>IP Setup</Text>
         </TouchableOpacity>
       </View>
 
@@ -292,6 +294,23 @@ const styles = StyleSheet.create({
     color: Colors.primary,
     fontSize: 14,
     fontWeight: '700',
+  },
+  a101MeterStrip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(253, 168, 58, 0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(253, 168, 58, 0.25)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: Layout.radius.sm,
+    marginBottom: 12,
+    gap: 6,
+  },
+  a101MeterText: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: '500',
   },
   actionsRow: {
     flexDirection: 'row',

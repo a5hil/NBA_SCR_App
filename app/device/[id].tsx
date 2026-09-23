@@ -1,5 +1,5 @@
-import React from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Switch } from 'react-native';
+import React, { useState, useEffect } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Switch, TextInput } from 'react-native';
 import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Colors } from '../../constants/colors';
 import { Layout } from '../../constants/layout';
@@ -9,7 +9,7 @@ import { Ionicons } from '@expo/vector-icons';
 
 export default function DeviceDetailScreen() {
   const { id, classroomId } = useLocalSearchParams<{ id: string; classroomId: string }>();
-  const { classrooms, toggleDevice, esp32Connected, esp32Ip } = useApp();
+  const { classrooms, toggleDevice, esp32Connected, esp32Ip, updateDeviceRatedPower } = useApp();
   const router = useRouter();
 
   const classroom = classroomId
@@ -36,6 +36,59 @@ export default function DeviceDetailScreen() {
   const isOffline = device.status === 'offline';
   const isCurtain = device.category === 'curtain';
   const isFan = device.category === 'fan';
+
+  const defaultRated = isFan ? 75 : device.category === 'light' ? 60 : 40;
+  const currentRated = device.ratedPower || defaultRated;
+  const [editingLoad, setEditingLoad] = useState(false);
+  const [inputWatts, setInputWatts] = useState(String(currentRated));
+  const [savingWatts, setSavingWatts] = useState(false);
+
+  useEffect(() => {
+    setInputWatts(String(currentRated));
+  }, [currentRated]);
+
+  const getPresets = () => {
+    if (device.category === 'light') {
+      return [
+        { label: '15W LED', watts: 15 },
+        { label: '28W Tube', watts: 28 },
+        { label: '40W Panel', watts: 40 },
+        { label: '60W Std', watts: 60 },
+        { label: '100W High', watts: 100 },
+      ];
+    }
+    if (device.category === 'fan') {
+      return [
+        { label: '28W BLDC', watts: 28 },
+        { label: '45W Eco', watts: 45 },
+        { label: '60W Med', watts: 60 },
+        { label: '75W Std', watts: 75 },
+      ];
+    }
+    if (device.category === 'curtain') {
+      return [
+        { label: '3W Idle', watts: 3 },
+        { label: '5W Servo', watts: 5 },
+        { label: '15W Motor', watts: 15 },
+      ];
+    }
+    return [
+      { label: '20W', watts: 20 },
+      { label: '40W', watts: 40 },
+      { label: '75W', watts: 75 },
+      { label: '150W', watts: 150 },
+    ];
+  };
+
+  const handleSaveWatts = async (val?: number) => {
+    const targetWatts = val !== undefined ? val : parseInt(inputWatts, 10);
+    if (isNaN(targetWatts) || targetWatts < 0 || targetWatts > 5000) return;
+    setSavingWatts(true);
+    await updateDeviceRatedPower(classroom.id, device.id, targetWatts);
+    setSavingWatts(false);
+    setInputWatts(String(targetWatts));
+    setEditingLoad(false);
+  };
 
   const getIcon = () => {
     switch (device.category) {
@@ -111,17 +164,119 @@ export default function DeviceDetailScreen() {
         {/* Stats Row */}
         <View style={styles.statsRow}>
           <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Load</Text>
-            <Text style={styles.statValue}>{device.powerUsage || 0}W</Text>
+            <Text style={styles.statLabel}>Current Draw</Text>
+            <Text style={[styles.statValue, { color: isOn ? Colors.primary : Colors.text }]}>
+              {device.powerUsage || 0}W
+            </Text>
+          </View>
+          <View style={styles.statCard}>
+            <Text style={styles.statLabel}>Rated Load</Text>
+            <Text style={styles.statValue}>{currentRated}W</Text>
           </View>
           <View style={styles.statCard}>
             <Text style={styles.statLabel}>Today</Text>
-            <Text style={styles.statValue}>{device.energyToday.toFixed(2)} kWh</Text>
+            <Text style={styles.statValue}>
+              {device.energyToday < 1 ? device.energyToday.toFixed(3) : device.energyToday.toFixed(2)} kWh
+            </Text>
           </View>
-          <View style={styles.statCard}>
-            <Text style={styles.statLabel}>Control Type</Text>
-            <Text style={styles.statValue}>{isCurtain ? 'Servo' : 'Relay'}</Text>
+        </View>
+
+        {/* User-Customizable Rated Power Specification */}
+        <View style={styles.loadCard}>
+          <View style={styles.loadHeader}>
+            <View style={styles.loadTitleRow}>
+              <View style={styles.loadIconBox}>
+                <Ionicons name="flash-outline" size={20} color={Colors.primary} />
+              </View>
+              <View style={styles.loadTextContainer}>
+                <Text style={styles.loadCardTitle} numberOfLines={1}>Rated Power Specification</Text>
+                <Text style={styles.loadCardSubtitle} numberOfLines={2}>
+                  Custom appliance rating used for energy calculations
+                </Text>
+              </View>
+            </View>
+            <TouchableOpacity 
+              style={styles.editLoadBtn}
+              onPress={() => {
+                setInputWatts(String(currentRated));
+                setEditingLoad(!editingLoad);
+              }}
+              activeOpacity={0.7}
+            >
+              <Ionicons name={editingLoad ? "close-outline" : "create-outline"} size={16} color={Colors.primary} />
+              <Text style={styles.editLoadBtnText}>{editingLoad ? "Cancel" : "Edit Rating"}</Text>
+            </TouchableOpacity>
           </View>
+
+          {/* Current rating display */}
+          <View style={styles.loadValueRow}>
+            <Text style={styles.loadValueLabel}>Nameplate Rating:</Text>
+            <Text style={styles.loadValueText}>{currentRated} <Text style={{ fontSize: 13, color: Colors.textMuted }}>Watts</Text></Text>
+          </View>
+
+          {/* Interactive Edit / Preset Section */}
+          {editingLoad && (
+            <View style={styles.loadEditContainer}>
+              <Text style={styles.loadEditLabel}>Quick Presets:</Text>
+              <View style={styles.presetsRow}>
+                {getPresets().map(p => (
+                  <TouchableOpacity
+                    key={p.watts}
+                    style={[styles.presetChip, currentRated === p.watts && styles.presetChipActive]}
+                    onPress={() => handleSaveWatts(p.watts)}
+                    disabled={savingWatts}
+                  >
+                    <Text style={[styles.presetChipText, currentRated === p.watts && styles.presetChipTextActive]}>
+                      {p.label}
+                    </Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+
+              <Text style={[styles.loadEditLabel, { marginTop: 14 }]}>Custom Wattage (Watts):</Text>
+              <View style={styles.customInputRow}>
+                <TouchableOpacity 
+                  style={styles.stepBtn}
+                  onPress={() => {
+                    const current = parseInt(inputWatts, 10) || currentRated;
+                    const next = Math.max(1, current - 5);
+                    setInputWatts(String(next));
+                  }}
+                >
+                  <Ionicons name="remove" size={18} color={Colors.text} />
+                </TouchableOpacity>
+
+                <TextInput
+                  style={styles.loadInput}
+                  value={inputWatts}
+                  onChangeText={setInputWatts}
+                  keyboardType="numeric"
+                  placeholder="e.g. 45"
+                  placeholderTextColor={Colors.textMuted}
+                />
+
+                <TouchableOpacity 
+                  style={styles.stepBtn}
+                  onPress={() => {
+                    const current = parseInt(inputWatts, 10) || currentRated;
+                    const next = current + 5;
+                    setInputWatts(String(next));
+                  }}
+                >
+                  <Ionicons name="add" size={18} color={Colors.text} />
+                </TouchableOpacity>
+
+                <TouchableOpacity 
+                  style={styles.saveWattsBtn}
+                  onPress={() => handleSaveWatts()}
+                  disabled={savingWatts}
+                  activeOpacity={0.8}
+                >
+                  <Text style={styles.saveWattsBtnText}>Save</Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          )}
         </View>
 
         {/* Quick Action Control Buttons */}
@@ -392,5 +547,158 @@ const styles = StyleSheet.create({
     color: Colors.text,
     fontSize: 13,
     fontWeight: '600',
+  },
+  loadCard: {
+    backgroundColor: Colors.card,
+    borderRadius: Layout.radius.lg,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: 'rgba(253, 168, 58, 0.25)',
+    marginBottom: 20,
+  },
+  loadHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: Colors.surfaceTranslucent,
+    gap: 10,
+  },
+  loadTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+  },
+  loadTextContainer: {
+    flex: 1,
+    paddingRight: 6,
+  },
+  loadIconBox: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(253, 168, 58, 0.15)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  loadCardTitle: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: '700',
+  },
+  loadCardSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 11,
+    marginTop: 2,
+    lineHeight: 15,
+  },
+  editLoadBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(253, 168, 58, 0.12)',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: Layout.radius.sm,
+    gap: 4,
+    flexShrink: 0,
+  },
+  editLoadBtnText: {
+    color: Colors.primary,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  loadValueRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingTop: 12,
+  },
+  loadValueLabel: {
+    color: Colors.textMuted,
+    fontSize: 13,
+  },
+  loadValueText: {
+    color: Colors.text,
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  loadEditContainer: {
+    marginTop: 14,
+    paddingTop: 14,
+    borderTopWidth: 1,
+    borderTopColor: Colors.surfaceTranslucent,
+  },
+  loadEditLabel: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 8,
+  },
+  presetsRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 8,
+  },
+  presetChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: Colors.surfaceTranslucent,
+    borderWidth: 1,
+    borderColor: 'transparent',
+  },
+  presetChipActive: {
+    backgroundColor: 'rgba(253, 168, 58, 0.2)',
+    borderColor: Colors.primary,
+  },
+  presetChipText: {
+    color: Colors.text,
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  presetChipTextActive: {
+    color: Colors.primary,
+  },
+  customInputRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  stepBtn: {
+    width: 38,
+    height: 38,
+    borderRadius: Layout.radius.sm,
+    backgroundColor: Colors.surfaceTranslucent,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: Colors.surfaceTranslucent,
+  },
+  loadInput: {
+    flex: 1,
+    height: 38,
+    backgroundColor: 'rgba(0, 0, 0, 0.25)',
+    borderRadius: Layout.radius.sm,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    color: Colors.text,
+    textAlign: 'center',
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  saveWattsBtn: {
+    backgroundColor: Colors.primary,
+    paddingHorizontal: 16,
+    height: 38,
+    borderRadius: Layout.radius.sm,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  saveWattsBtnText: {
+    color: '#000',
+    fontSize: 13,
+    fontWeight: '700',
   },
 });

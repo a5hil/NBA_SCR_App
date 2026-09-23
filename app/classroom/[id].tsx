@@ -10,10 +10,12 @@ import { Ionicons } from '@expo/vector-icons';
 
 export default function ClassroomDetailScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
-  const { classrooms, toggleDevice, openEsp32WebConsole, esp32Connected, esp32Ip } = useApp();
+  const { classrooms, toggleDevice, esp32Connected, esp32Ip } = useApp();
   const router = useRouter();
 
-  const classroom = classrooms.find(c => c.id === id);
+  const classroom = classrooms.find(
+    c => c.id === id || c.id === `cls-${id}` || c.number?.toLowerCase() === id?.toLowerCase()
+  );
 
   if (!classroom) {
     return (
@@ -29,7 +31,10 @@ export default function ClassroomDetailScreen() {
   const isOffline = classroom.status === 'offline';
   const isOccupied = classroom.occupancy === 'occupied';
   const activeCount = classroom.devices.filter(d => d.status === 'on').length;
-  const isEsp32Controlled = classroom.id.includes('101') || classroom.id.includes('102');
+  const isEsp32Controlled = classroom.controller?.id === 'ctrl-esp32' || 
+    classroom.id.includes('101') || 
+    classroom.id.includes('102') || 
+    classroom.id.includes('corr');
 
   return (
     <View style={styles.container}>
@@ -64,27 +69,25 @@ export default function ClassroomDetailScreen() {
             </View>
             <View>
               <Text style={styles.infoLabel}>Current Load</Text>
-              <Text style={styles.infoValue}>{(classroom.currentLoad / 1000).toFixed(2)} kW</Text>
+              <Text style={styles.infoValue}>
+                {classroom.currentLoad < 1000 ? `${classroom.currentLoad.toFixed(1)} W` : `${(classroom.currentLoad / 1000).toFixed(2)} kW`}
+              </Text>
             </View>
           </View>
         </View>
 
-        {/* ESP32 Hardware Console Quick Launcher */}
+        {/* ESP32 Hardware Status Banner */}
         {isEsp32Controlled && (
-          <TouchableOpacity 
-            style={styles.hardwareBanner}
-            onPress={openEsp32WebConsole}
-            activeOpacity={0.8}
-          >
+          <View style={styles.hardwareBanner}>
             <View style={styles.hardwareLeft}>
               <View style={[styles.hardwareDot, { backgroundColor: esp32Connected ? Colors.success : Colors.warning }]} />
               <View>
                 <Text style={styles.hardwareTitle}>ESP32 Controller ({esp32Connected ? 'Live' : 'Standby'})</Text>
-                <Text style={styles.hardwareSubtitle}>Tap to launch ESP32 Web App • {esp32Ip}</Text>
+                <Text style={styles.hardwareSubtitle}>Controlled via App • {esp32Ip || 'Auto-Detected'}</Text>
               </View>
             </View>
-            <Ionicons name="open-outline" size={20} color={Colors.primary} />
-          </TouchableOpacity>
+            <Ionicons name="hardware-chip-outline" size={20} color={Colors.primary} />
+          </View>
         )}
 
         {isOffline && !isEsp32Controlled && (
@@ -93,6 +96,58 @@ export default function ClassroomDetailScreen() {
             <View style={styles.offlineTextContainer}>
               <Text style={styles.offlineTitle}>Controller Offline</Text>
               <Text style={styles.offlineDesc}>Last seen: {new Date(classroom.controller.lastSeen).toLocaleTimeString()}</Text>
+            </View>
+          </View>
+        )}
+
+        {/* Real-time ACS712 & ZMPT101B Energy Meter (Exclusive to Classroom A101) */}
+        {classroom.hasPowerMeter && (
+          <View style={styles.meterCard}>
+            <View style={styles.meterHeader}>
+              <View style={styles.meterTitleRow}>
+                <View style={styles.meterIconBox}>
+                  <Ionicons name="speedometer-outline" size={20} color={Colors.primary} />
+                </View>
+                <View>
+                  <Text style={styles.meterTitle}>AC Power Telemetry</Text>
+                  <Text style={styles.meterSubtitle}>ZMPT101B (GPIO 39) • ACS712 (GPIO 36)</Text>
+                </View>
+              </View>
+              <View style={styles.meterLiveTag}>
+                <View style={[styles.hardwareDot, { backgroundColor: esp32Connected ? Colors.success : Colors.textMuted }]} />
+                <Text style={[styles.meterLiveText, { color: esp32Connected ? Colors.success : Colors.textMuted }]}>
+                  {esp32Connected ? 'RMS LIVE' : 'STANDBY'}
+                </Text>
+              </View>
+            </View>
+
+            <View style={styles.meterStatsGrid}>
+              <View style={styles.meterStatBox}>
+                <Text style={styles.meterStatLabel}>AC Voltage</Text>
+                <Text style={styles.meterStatValue}>
+                  {classroom.voltage !== undefined ? classroom.voltage.toFixed(1) : '0.0'}
+                  <Text style={styles.meterStatUnit}> V</Text>
+                </Text>
+                <Text style={styles.meterStatSub}>Mains RMS</Text>
+              </View>
+
+              <View style={styles.meterStatBox}>
+                <Text style={styles.meterStatLabel}>AC Current</Text>
+                <Text style={styles.meterStatValue}>
+                  {classroom.current !== undefined ? classroom.current.toFixed(2) : '0.00'}
+                  <Text style={styles.meterStatUnit}> A</Text>
+                </Text>
+                <Text style={styles.meterStatSub}>Load RMS</Text>
+              </View>
+
+              <View style={styles.meterStatBox}>
+                <Text style={styles.meterStatLabel}>Active Load</Text>
+                <Text style={[styles.meterStatValue, { color: Colors.primary }]}>
+                  {classroom.currentLoad.toFixed(1)}
+                  <Text style={styles.meterStatUnit}> W</Text>
+                </Text>
+                <Text style={styles.meterStatSub}>Real Power</Text>
+              </View>
             </View>
           </View>
         )}
@@ -242,5 +297,95 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     flexWrap: 'wrap',
     justifyContent: 'space-between',
+  },
+  meterCard: {
+    backgroundColor: '#1E1D1B',
+    borderRadius: Layout.radius.lg,
+    borderWidth: 1,
+    borderColor: 'rgba(253, 168, 58, 0.25)',
+    padding: 16,
+    marginBottom: 24,
+  },
+  meterHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.08)',
+    marginBottom: 14,
+  },
+  meterTitleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  meterIconBox: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(253, 168, 58, 0.15)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  meterTitle: {
+    color: Colors.text,
+    fontSize: 15,
+    fontWeight: '700',
+  },
+  meterSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 11,
+    marginTop: 1,
+  },
+  meterLiveTag: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+    gap: 6,
+  },
+  meterLiveText: {
+    fontSize: 10,
+    fontWeight: '700',
+    letterSpacing: 0.5,
+  },
+  meterStatsGrid: {
+    flexDirection: 'row',
+    gap: 10,
+  },
+  meterStatBox: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.25)',
+    borderRadius: Layout.radius.md,
+    padding: 12,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.05)',
+  },
+  meterStatLabel: {
+    color: Colors.textMuted,
+    fontSize: 11,
+    fontWeight: '500',
+    marginBottom: 4,
+    textAlign: 'center',
+  },
+  meterStatValue: {
+    color: Colors.text,
+    fontSize: 18,
+    fontWeight: '800',
+  },
+  meterStatUnit: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: Colors.textMuted,
+  },
+  meterStatSub: {
+    color: Colors.textMuted,
+    fontSize: 10,
+    marginTop: 2,
+    opacity: 0.7,
   },
 });

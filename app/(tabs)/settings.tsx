@@ -1,5 +1,5 @@
 import React from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Alert as RNAlert } from 'react-native';
+import { View, Text, StyleSheet, ScrollView } from 'react-native';
 import { Colors } from '../../constants/colors';
 import { Layout } from '../../constants/layout';
 import { ScreenHeader } from '../../components/ScreenHeader';
@@ -8,20 +8,9 @@ import { Ionicons } from '@expo/vector-icons';
 import { Esp32LiveBar } from '../../components/Esp32LiveBar';
 
 export default function SettingsScreen() {
-  const { user, campus, classrooms, resetData, esp32Ip, esp32Connected, esp32Telemetry } = useApp();
+  const { user, campus, classrooms, esp32Connected, esp32Telemetry } = useApp();
 
   const totalDevices = classrooms.reduce((sum, c) => sum + c.devices.length, 0);
-
-  const handleReset = () => {
-    RNAlert.alert(
-      'Reset Data',
-      'This will reset classroom devices and cache to default state. Continue?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        { text: 'Reset', style: 'destructive', onPress: resetData },
-      ]
-    );
-  };
 
   return (
     <View style={styles.container}>
@@ -55,7 +44,7 @@ export default function SettingsScreen() {
             <View style={styles.infoRow}>
               <Ionicons name="wifi" size={18} color={esp32Connected ? Colors.success : Colors.textMuted} />
               <Text style={styles.infoLabel}>Wi-Fi Network</Text>
-              <Text style={styles.infoValue}>IDEA LAB</Text>
+              <Text style={styles.infoValue}>{esp32Connected ? 'FTTH-6953 (Live)' : 'FTTH-6953'}</Text>
             </View>
             <View style={styles.infoRow}>
               <Ionicons name="globe-outline" size={18} color={Colors.primary} />
@@ -65,7 +54,7 @@ export default function SettingsScreen() {
             <View style={styles.infoRow}>
               <Ionicons name="git-branch" size={18} color={Colors.primary} />
               <Text style={styles.infoLabel}>Firmware</Text>
-              <Text style={styles.infoValue}>v{esp32Telemetry?.firmware || '2.2.0'}</Text>
+              <Text style={styles.infoValue}>v{esp32Telemetry?.firmware || '2.4.1'}</Text>
             </View>
             <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
               <Ionicons name="layers" size={18} color={Colors.primary} />
@@ -90,18 +79,6 @@ export default function SettingsScreen() {
               <Text style={styles.infoValue}>{campus.department}</Text>
             </View>
           </View>
-        </View>
-
-        {/* Danger Zone */}
-        <View style={styles.section}>
-          <TouchableOpacity 
-            style={styles.resetButton}
-            onPress={handleReset}
-            activeOpacity={0.8}
-          >
-            <Ionicons name="refresh-circle-outline" size={20} color={Colors.critical} />
-            <Text style={styles.resetButtonText}>Reset Demo Data</Text>
-          </TouchableOpacity>
         </View>
 
         <View style={{ height: 100 }} />
@@ -193,21 +170,5 @@ const styles = StyleSheet.create({
     color: Colors.text,
     fontSize: 13,
     fontWeight: '600',
-  },
-  resetButton: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    backgroundColor: 'rgba(239, 68, 68, 0.1)',
-    borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.3)',
-    borderRadius: Layout.radius.md,
-    padding: 14,
-    gap: 8,
-  },
-  resetButtonText: {
-    color: Colors.critical,
-    fontSize: 14,
-    fontWeight: '700',
   },
 });

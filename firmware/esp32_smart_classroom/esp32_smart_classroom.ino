@@ -16,18 +16,21 @@
  * ==============================================================================
  */
 
-#include <Arduino.h>
-#include <WiFi.h>
-#include <WebServer.h>
-#include <HTTPClient.h>
-#include <WiFiClientSecure.h>
-#include <ArduinoJson.h>
-#include <ESPmDNS.h>
-#include <Wire.h>
+#include "soc/rtc_cntl_reg.h"
+#include "soc/soc.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <Arduino.h>
+#include <ArduinoJson.h>
 #include <DHT.h>
 #include <ESP32Servo.h>
+#include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <WebServer.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <Wire.h>
 
 #include "config.h"
 
@@ -39,96 +42,275 @@ Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET_PIN);
 DHT dht(DHTPIN, DHTTYPE);
 Servo curtain1;
 Servo curtain2;
+Preferences preferences;
 
 // ==========================================
 // --- SYSTEM STATE & THRESHOLDS ---
 // ==========================================
-volatile bool isAutoMode = false; // Default to manual mode so mobile app controls relays reliably
+volatile bool isAutoMode = false; // Loaded from NVS in setup()
+void setSystemModeInternal(bool autoMode, bool notifyCloud = true);
 
-float currentTempThreshold    = DEFAULT_TEMP_THRESHOLD;
-int   currentLdrThreshold     = DEFAULT_LDR_THRESHOLD;
+float currentTempThreshold = DEFAULT_TEMP_THRESHOLD;
+int currentLdrThreshold = DEFAULT_LDR_THRESHOLD;
 unsigned long currentHoldTime = OCCUPANCY_HOLD_MS;
 
 // Shared Sensors
 volatile float currentTemp = 24.0;
-volatile float currentHum  = 50.0;
-volatile int   ldr1_value  = 0;
-volatile int   ldr2_value  = 0;
+volatile float currentHum = 50.0;
+volatile int ldr1_value = 0;
+volatile int ldr2_value = 0;
 
 // Classroom 1 (A101) State
-volatile bool pir1_active          = false;
-volatile bool c1_occupied          = false;
+volatile bool pir1_active = false;
+volatile bool c1_occupied = false;
 volatile unsigned long c1_last_motion = 0;
-volatile bool state_c1_light       = false;
-volatile bool state_c1_fan         = false;
-volatile bool state_c1_curtain     = false;
-int  current_c1_angle     = SERVO_CLOSED_ANGLE;
-int  target_c1_angle      = SERVO_CLOSED_ANGLE;
+volatile bool state_c1_light = false;
+volatile bool state_c1_fan = false;
+volatile bool state_c1_curtain = false;
+int current_c1_angle = SERVO_CLOSED_ANGLE;
+int target_c1_angle = SERVO_CLOSED_ANGLE;
 unsigned long last_servo1_move = 0;
-bool servo1_attached      = false;
+bool servo1_attached = false;
+
+// Classroom 1 (A101) AC Power Meter (ACS712 Current & ZMPT101B Voltage)
+volatile float c1_voltage = 0.0;    // Vrms (Volts AC)
+volatile float c1_current = 0.0;    // Irms (Amperes AC)
+volatile float c1_real_power = 0.0; // P (Watts Active Load)
+unsigned long lastPowerSample = 0;
+
+// Dynamic Real Energy Accumulators (kWh & Cost)
+volatile double c1_accumulated_kwh = 0.0;
+volatile double c2_accumulated_kwh = 0.0;
+float c1_hourly_kwh[24] = {0.0f};
+unsigned long lastEnergyIntegrateMs = 0;
+unsigned long lastEnergySaveNvsMs = 0;
+int lastRecordedHour = -1;
 
 // Classroom 2 (A102) State
-volatile bool pir2_active          = false;
-volatile bool c2_occupied          = false;
+volatile bool pir2_active = false;
+volatile bool c2_occupied = false;
 volatile unsigned long c2_last_motion = 0;
-volatile bool state_c2_light       = false;
-volatile bool state_c2_fan         = false;
-volatile bool state_c2_curtain     = false;
-int  current_c2_angle     = SERVO_CLOSED_ANGLE;
-int  target_c2_angle      = SERVO_CLOSED_ANGLE;
+volatile bool state_c2_light = false;
+volatile bool state_c2_fan = false;
+volatile bool state_c2_curtain = false;
+int current_c2_angle = SERVO_CLOSED_ANGLE;
+int target_c2_angle = SERVO_CLOSED_ANGLE;
 unsigned long last_servo2_move = 0;
-bool servo2_attached      = false;
+bool servo2_attached = false;
 
 // Corridor States
 volatile bool state_corr1_light = false;
 volatile bool state_corr2_light = false;
 
-// Cloud State Tracking (Prevents stale DB polls from overriding local sensor actions)
-bool cloud_initialized      = false;
-bool cloud_prev_c1_light    = false;
-bool cloud_prev_c1_fan      = false;
-bool cloud_prev_c1_curtain  = false;
-bool cloud_prev_c2_light    = false;
-bool cloud_prev_c2_fan      = false;
-bool cloud_prev_c2_curtain  = false;
+// Cloud State Tracking (Prevents stale DB polls from overriding local sensor
+// actions)
+bool cloud_initialized = false;
+bool cloud_prev_c1_light = false;
+bool cloud_prev_c1_fan = false;
+bool cloud_prev_c1_curtain = false;
+bool cloud_prev_c2_light = false;
+bool cloud_prev_c2_fan = false;
+bool cloud_prev_c2_curtain = false;
 bool cloud_prev_corr1_light = false;
 bool cloud_prev_corr2_light = false;
+bool cloud_prev_system_auto = false;
 volatile bool pendingModeCloudSync = false;
+unsigned long lastLocalModeChange = 0;
 
 // OLED Hardware flag
 bool oledFound = false;
 
 // ==========================================
+// ==========================================
+// --- CLASSROOM A101 AC POWER METER SAMPLING ---
+// ==========================================
+// Samples ACS712 Current & ZMPT101B Voltage over a 40ms window
+// (Exactly two 50Hz AC cycles or 2.4 60Hz cycles)
+void sampleA101PowerMeter() {
+  unsigned long now = millis();
+  if (now - lastPowerSample < POWER_METER_SAMPLE_MS) {
+    return;
+  }
+  lastPowerSample = now;
+
+  // Collect 160 evenly spaced samples over 40ms (250us interval)
+  const int NUM_SAMPLES = 160;
+  static int rawV[NUM_SAMPLES];
+  static int rawI[NUM_SAMPLES];
+  long sumRawV = 0;
+  long sumRawI = 0;
+
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    rawV[i] = analogRead(ZMPT101B_VOLTAGE_PIN);
+    rawI[i] = analogRead(ACS712_CURRENT_PIN);
+    sumRawV += rawV[i];
+    sumRawI += rawI[i];
+    delayMicroseconds(250);
+  }
+
+  // Dynamic DC bias midpoint (ACS712 & ZMPT101B naturally center around Vcc/2)
+  float midV = (float)sumRawV / NUM_SAMPLES;
+  float midI = (float)sumRawI / NUM_SAMPLES;
+
+  // Calculate RMS deviation from DC midpoint
+  double sumSqV = 0.0;
+  double sumSqI = 0.0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    float diffV = (float)rawV[i] - midV;
+    float diffI = (float)rawI[i] - midI;
+    sumSqV += (diffV * diffV);
+    sumSqI += (diffI * diffI);
+  }
+
+  // Convert ADC counts to RMS Volts at ESP32 pin (3.3V reference on 12-bit ADC)
+  float vAdcRms = sqrt(sumSqV / NUM_SAMPLES) * (3.3f / 4095.0f);
+  float iAdcRms = sqrt(sumSqI / NUM_SAMPLES) * (3.3f / 4095.0f);
+
+  // Scaled physical values
+  float vRms = vAdcRms * ZMPT101B_CALIBRATION;
+  float iRms = iAdcRms / ACS712_SENSITIVITY;
+
+  // Robust noise gate:
+  // Mains AC is ~230V. Any reading under 60V on an open input is ambient
+  // electromagnetic pickup (50Hz antenna effect on high-gain ZMPT101B op-amp).
+  if (vRms < 60.0f) {
+    vRms = 0.0f;
+  }
+
+  // Hall-effect sensor ACS712 has inherent thermal/switching noise (~21mV
+  // pk-pk). Readout below 0.09A is quiescent baseline noise.
+  if (iRms < 0.09f) {
+    iRms = 0.0f;
+  }
+
+  // If NO AC Mains line is connected (no voltage detected), there cannot be
+  // real AC current or active power. Force clean zero.
+  if (vRms < 60.0f) {
+    c1_voltage = 0.0f;
+    c1_current = 0.0f;
+    c1_real_power = 0.0f;
+    return;
+  }
+
+  c1_voltage = vRms;
+  c1_current = iRms;
+
+  // Calculate Real Power (Watts): P = Vrms * Irms * PowerFactor
+  if (c1_voltage >= 60.0f && c1_current >= 0.09f) {
+    c1_real_power = c1_voltage * c1_current * POWER_FACTOR_A101;
+  } else {
+    c1_real_power = 0.0f;
+  }
+}
+
+// ==========================================
 // --- POWER TELEMETRY HELPERS ---
 // ==========================================
+float rated_c1_light = WATTS_CLASS_LIGHT;
+float rated_c1_fan = WATTS_CLASS_FAN;
+float rated_c2_light = WATTS_CLASS_LIGHT;
+float rated_c2_fan = WATTS_CLASS_FAN;
+float rated_corr1 = WATTS_CORR_LIGHT;
+float rated_corr2 = WATTS_CORR_LIGHT;
+
 float getC1LoadWatts() {
+  // If physical ACS712/ZMPT101B detects real active power, use measured value
+  if (c1_real_power > 0.5f) {
+    return c1_real_power;
+  }
+  // Otherwise fallback to rated relay load
   float w = 0.0;
-  if (state_c1_light)   w += WATTS_CLASS_LIGHT;
-  if (state_c1_fan)     w += WATTS_CLASS_FAN;
-  if (state_c1_curtain) w += WATTS_SERVO_ACTIVE;
+  if (state_c1_light)
+    w += rated_c1_light;
+  if (state_c1_fan)
+    w += rated_c1_fan;
+  if (state_c1_curtain)
+    w += WATTS_SERVO_ACTIVE;
   return w;
 }
 
 float getC2LoadWatts() {
   float w = 0.0;
-  if (state_c2_light)   w += WATTS_CLASS_LIGHT;
-  if (state_c2_fan)     w += WATTS_CLASS_FAN;
-  if (state_c2_curtain) w += WATTS_SERVO_ACTIVE;
+  if (state_c2_light)
+    w += rated_c2_light;
+  if (state_c2_fan)
+    w += rated_c2_fan;
+  if (state_c2_curtain)
+    w += WATTS_SERVO_ACTIVE;
   return w;
 }
 
 float getTotalLoadWatts() {
   float w = getC1LoadWatts() + getC2LoadWatts();
-  if (state_corr1_light) w += WATTS_CORR_LIGHT;
-  if (state_corr2_light) w += WATTS_CORR_LIGHT;
+  if (state_corr1_light)
+    w += rated_corr1;
+  if (state_corr2_light)
+    w += rated_corr2;
   return w;
 }
 
 float getCorrLoadWatts() {
   float w = 0.0;
-  if (state_corr1_light) w += WATTS_CORR_LIGHT;
-  if (state_corr2_light) w += WATTS_CORR_LIGHT;
+  if (state_corr1_light)
+    w += rated_corr1;
+  if (state_corr2_light)
+    w += rated_corr2;
   return w;
+}
+
+// ==========================================
+// --- REAL-TIME ENERGY INTEGRATION (kWh) ---
+// ==========================================
+// Integrates real active power over time: kWh = (Watts * dt_hours) / 1000
+void integrateRealEnergy() {
+  unsigned long now = millis();
+  if (lastEnergyIntegrateMs == 0) {
+    lastEnergyIntegrateMs = now;
+    return;
+  }
+
+  unsigned long elapsedMs = now - lastEnergyIntegrateMs;
+  if (elapsedMs < 1000) {
+    return; // Integrate every ~1.0 second
+  }
+  lastEnergyIntegrateMs = now;
+
+  double dtHours = (double)elapsedMs / 3600000.0;
+
+  // Classroom 1: Real measured watts (from ACS712 & ZMPT101B when active)
+  float w1 = getC1LoadWatts();
+  double deltaKwh1 = ((double)w1 / 1000.0) * dtHours;
+  c1_accumulated_kwh += deltaKwh1;
+
+  // Classroom 2: Relay-based load
+  float w2 = getC2LoadWatts();
+  double deltaKwh2 = ((double)w2 / 1000.0) * dtHours;
+  c2_accumulated_kwh += deltaKwh2;
+
+  // Track hourly consumption bucket
+  struct tm timeinfo;
+  int currentHour = (now / 3600000) % 24; // Default fallback to uptime hours
+  if (getLocalTime(&timeinfo, 20)) {
+    currentHour = timeinfo.tm_hour;
+    // Auto-reset daily energy at midnight (00:00)
+    if (lastRecordedHour == 23 && currentHour == 0) {
+      c1_accumulated_kwh = 0.0;
+      c2_accumulated_kwh = 0.0;
+      for (int i = 0; i < 24; i++)
+        c1_hourly_kwh[i] = 0.0f;
+    }
+  }
+  lastRecordedHour = currentHour;
+  if (currentHour >= 0 && currentHour < 24) {
+    c1_hourly_kwh[currentHour] += (float)deltaKwh1;
+  }
+
+  // Periodic persistence to ESP32 Flash (every 5 minutes)
+  if (now - lastEnergySaveNvsMs >= 300000) {
+    lastEnergySaveNvsMs = now;
+    preferences.putFloat("c1_kwh", (float)c1_accumulated_kwh);
+    preferences.putFloat("c2_kwh", (float)c2_accumulated_kwh);
+  }
 }
 
 // ==========================================
@@ -149,8 +331,10 @@ void updateServos() {
     }
     if (now - last_servo1_move >= SERVO_SPEED_MS) {
       last_servo1_move = now;
-      if (current_c1_angle < target_c1_angle) current_c1_angle++;
-      else current_c1_angle--;
+      if (current_c1_angle < target_c1_angle)
+        current_c1_angle++;
+      else
+        current_c1_angle--;
       curtain1.write(current_c1_angle);
     }
   } else {
@@ -169,8 +353,10 @@ void updateServos() {
     }
     if (now - last_servo2_move >= SERVO_SPEED_MS) {
       last_servo2_move = now;
-      if (current_c2_angle < target_c2_angle) current_c2_angle++;
-      else current_c2_angle--;
+      if (current_c2_angle < target_c2_angle)
+        current_c2_angle++;
+      else
+        current_c2_angle--;
       curtain2.write(current_c2_angle);
     }
   } else {
@@ -182,15 +368,82 @@ void updateServos() {
 }
 
 // ==========================================
+// --- SYSTEM MODE CONTROLLER (NVS PERSISTENT) ---
+// ==========================================
+void setSystemModeInternal(bool autoMode, bool notifyCloud) {
+  if (isAutoMode != autoMode) {
+    isAutoMode = autoMode;
+    cloud_prev_system_auto = autoMode;
+    preferences.putBool("auto_mode", autoMode);
+    if (notifyCloud) {
+      pendingModeCloudSync = true;
+      lastLocalModeChange = millis();
+    }
+    Serial.printf("[SYSTEM] Mode updated -> %s (saved to NVS)\n",
+                  isAutoMode ? "AUTO" : "MANUAL");
+  }
+}
+
+// ==========================================
 // --- PHYSICAL RELAY SYNCHRONIZATION ---
 // ==========================================
+// Staggered & state-cached relay actuation to prevent simultaneous coil inrush
+// current spikes
 void applyRelayStates() {
-  digitalWrite(RELAY_CLASS_LIGHT1,    state_c1_light    ? RELAY_ON : RELAY_OFF);
-  digitalWrite(RELAY_CLASS_FAN1,      state_c1_fan      ? RELAY_ON : RELAY_OFF);
-  digitalWrite(RELAY_CLASS_LIGHT2,    state_c2_light    ? RELAY_ON : RELAY_OFF);
-  digitalWrite(RELAY_CLASS_FAN2,      state_c2_fan      ? RELAY_ON : RELAY_OFF);
-  digitalWrite(RELAY_CORRIDOR_LIGHT1, state_corr1_light ? RELAY_ON : RELAY_OFF);
-  digitalWrite(RELAY_CORRIDOR_LIGHT2, state_corr2_light ? RELAY_ON : RELAY_OFF);
+  static int hw_c1_light = -1;
+  static int hw_c1_fan = -1;
+  static int hw_c2_light = -1;
+  static int hw_c2_fan = -1;
+  static int hw_corr1 = -1;
+  static int hw_corr2 = -1;
+
+  int t_c1_l = state_c1_light ? RELAY_ON : RELAY_OFF;
+  if (hw_c1_light != t_c1_l) {
+    digitalWrite(RELAY_CLASS_LIGHT1, t_c1_l);
+    hw_c1_light = t_c1_l;
+    if (t_c1_l == RELAY_ON)
+      delay(15); // Suppress multi-relay instantaneous inrush spike
+  }
+
+  int t_c1_f = state_c1_fan ? RELAY_ON : RELAY_OFF;
+  if (hw_c1_fan != t_c1_f) {
+    digitalWrite(RELAY_CLASS_FAN1, t_c1_f);
+    hw_c1_fan = t_c1_f;
+    if (t_c1_f == RELAY_ON)
+      delay(15);
+  }
+
+  int t_c2_l = state_c2_light ? RELAY_ON : RELAY_OFF;
+  if (hw_c2_light != t_c2_l) {
+    digitalWrite(RELAY_CLASS_LIGHT2, t_c2_l);
+    hw_c2_light = t_c2_l;
+    if (t_c2_l == RELAY_ON)
+      delay(15);
+  }
+
+  int t_c2_f = state_c2_fan ? RELAY_ON : RELAY_OFF;
+  if (hw_c2_fan != t_c2_f) {
+    digitalWrite(RELAY_CLASS_FAN2, t_c2_f);
+    hw_c2_fan = t_c2_f;
+    if (t_c2_f == RELAY_ON)
+      delay(15);
+  }
+
+  int t_cr1 = state_corr1_light ? RELAY_ON : RELAY_OFF;
+  if (hw_corr1 != t_cr1) {
+    digitalWrite(RELAY_CORRIDOR_LIGHT1, t_cr1);
+    hw_corr1 = t_cr1;
+    if (t_cr1 == RELAY_ON)
+      delay(15);
+  }
+
+  int t_cr2 = state_corr2_light ? RELAY_ON : RELAY_OFF;
+  if (hw_corr2 != t_cr2) {
+    digitalWrite(RELAY_CORRIDOR_LIGHT2, t_cr2);
+    hw_corr2 = t_cr2;
+    if (t_cr2 == RELAY_ON)
+      delay(15);
+  }
 }
 
 // ==========================================
@@ -199,7 +452,8 @@ void applyRelayStates() {
 void enableCORS() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT");
-  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  server.sendHeader("Access-Control-Allow-Headers",
+                    "Content-Type, Authorization, X-Requested-With");
 }
 
 void handleOptions() {
@@ -210,7 +464,8 @@ void handleOptions() {
 // ==========================================
 // --- REST API: STATUS ---
 // ==========================================
-// Generates status JSON (100% backward compatible with original code + app fields)
+// Generates status JSON (100% backward compatible with original code + app
+// fields)
 String buildStatusJson(bool includeTelemetry = true) {
   String json = "{";
   json += "\"status\":\"ok\",";
@@ -219,7 +474,7 @@ String buildStatusJson(bool includeTelemetry = true) {
   json += "\"humidity\":" + String(currentHum, 1) + ",";
   json += "\"total_load_watts\":" + String(getTotalLoadWatts(), 1) + ",";
 
-  // Classroom 1 (cls-a101)
+  // Classroom 1 (cls-a101) - Equipped with ACS712 & ZMPT101B
   json += "\"classroom1\":{";
   json += "\"id\":\"" + String(CLASSROOM_1_ID) + "\",";
   json += "\"name\":\"" + String(CLASSROOM_1_NAME) + "\",";
@@ -230,10 +485,16 @@ String buildStatusJson(bool includeTelemetry = true) {
   json += "\"fan\":" + String(state_c1_fan ? "true" : "false") + ",";
   json += "\"curtain\":" + String(state_c1_curtain ? "true" : "false") + ",";
   json += "\"curtain_angle\":" + String(current_c1_angle) + ",";
-  json += "\"load_watts\":" + String(getC1LoadWatts(), 1);
+  json += "\"load_watts\":" + String(getC1LoadWatts(), 1) + ",";
+  json += "\"voltage\":" + String(c1_voltage, 1) + ",";
+  json += "\"current\":" + String(c1_current, 2) + ",";
+  json += "\"power_watts\":" + String(c1_real_power, 1) + ",";
+  json += "\"energy_today\":" + String(c1_accumulated_kwh, 4) + ",";
+  json += "\"estimated_cost\":" + String(c1_accumulated_kwh * 8.0, 2) + ",";
+  json += "\"has_power_meter\":true";
   json += "},";
 
-  // Classroom 2 (cls-a102)
+  // Classroom 2 (cls-a102) - Standard setup (No Power Meter)
   json += "\"classroom2\":{";
   json += "\"id\":\"" + String(CLASSROOM_2_ID) + "\",";
   json += "\"name\":\"" + String(CLASSROOM_2_NAME) + "\",";
@@ -244,7 +505,13 @@ String buildStatusJson(bool includeTelemetry = true) {
   json += "\"fan\":" + String(state_c2_fan ? "true" : "false") + ",";
   json += "\"curtain\":" + String(state_c2_curtain ? "true" : "false") + ",";
   json += "\"curtain_angle\":" + String(current_c2_angle) + ",";
-  json += "\"load_watts\":" + String(getC2LoadWatts(), 1);
+  json += "\"load_watts\":" + String(getC2LoadWatts(), 1) + ",";
+  json += "\"voltage\":0.0,";
+  json += "\"current\":0.0,";
+  json += "\"power_watts\":0.0,";
+  json += "\"energy_today\":" + String(c2_accumulated_kwh, 4) + ",";
+  json += "\"estimated_cost\":" + String(c2_accumulated_kwh * 8.0, 2) + ",";
+  json += "\"has_power_meter\":false";
   json += "},";
 
   // Corridors
@@ -253,7 +520,16 @@ String buildStatusJson(bool includeTelemetry = true) {
   json += "\"light1\":" + String(state_corr1_light ? "true" : "false") + ",";
   json += "\"ldr2_raw\":" + String(ldr2_value) + ",";
   json += "\"light2\":" + String(state_corr2_light ? "true" : "false");
-  json += "}";
+  json += "},";
+
+  // Real 24-hour Energy Consumption Array (for App Consumption Charts)
+  json += "\"hourly_energy\":[";
+  for (int h = 0; h < 24; h++) {
+    json += String(c1_hourly_kwh[h], 4);
+    if (h < 23)
+      json += ",";
+  }
+  json += "]";
 
   if (includeTelemetry) {
     json += ",\"controller\":{";
@@ -279,19 +555,21 @@ void handleStatus() {
 // ==========================================
 void handleMode() {
   enableCORS();
-  bool prevAuto = isAutoMode;
   if (server.hasArg("auto")) {
-    isAutoMode = (server.arg("auto") == "1" || server.arg("auto") == "true");
+    setSystemModeInternal(
+        server.arg("auto") == "1" || server.arg("auto") == "true", true);
   } else if (server.hasArg("plain")) {
     String body = server.arg("plain");
-    if (body.indexOf("\"auto\":true") >= 0 || body.indexOf("\"auto\":1") >= 0) isAutoMode = true;
-    else if (body.indexOf("\"auto\":false") >= 0 || body.indexOf("\"auto\":0") >= 0) isAutoMode = false;
+    if (body.indexOf("\"auto\":true") >= 0 || body.indexOf("\"auto\":1") >= 0) {
+      setSystemModeInternal(true, true);
+    } else if (body.indexOf("\"auto\":false") >= 0 ||
+               body.indexOf("\"auto\":0") >= 0) {
+      setSystemModeInternal(false, true);
+    }
   }
-  if (isAutoMode != prevAuto) {
-    pendingModeCloudSync = true;
-    Serial.printf("[SYSTEM] Mode changed via Local API -> %s\n", isAutoMode ? "AUTO" : "MANUAL");
-  }
-  server.send(200, "application/json", "{\"status\":\"ok\",\"mode\":\"" + String(isAutoMode ? "auto" : "manual") + "\"}");
+  server.send(200, "application/json",
+              "{\"status\":\"ok\",\"mode\":\"" +
+                  String(isAutoMode ? "auto" : "manual") + "\"}");
 }
 
 // ==========================================
@@ -300,37 +578,43 @@ void handleMode() {
 // Supports legacy query params (dev=l1&st=1) AND modern app device IDs
 void applyDeviceControl(String dev, bool st) {
   dev.toLowerCase();
-  
+
   // Classroom 1 / A101
-  if (dev == "l1" || dev == "light1" || dev == "dev-a101-light" || dev == "dev-a101-light-1" || dev == "dev-a101-light-2") {
+  if (dev == "l1" || dev == "light1" || dev == "dev-a101-light" ||
+      dev == "dev-a101-light-1" || dev == "dev-a101-light-2") {
     state_c1_light = st;
-  } else if (dev == "f1" || dev == "fan1" || dev == "dev-a101-fan" || dev == "dev-a101-fan-1" || dev == "dev-a101-fan-2") {
+  } else if (dev == "f1" || dev == "fan1" || dev == "dev-a101-fan" ||
+             dev == "dev-a101-fan-1" || dev == "dev-a101-fan-2") {
     state_c1_fan = st;
   } else if (dev == "c1" || dev == "curtain1" || dev == "dev-a101-curtain") {
     state_c1_curtain = st;
   }
   // Classroom 2 / A102
-  else if (dev == "l2" || dev == "light2" || dev == "dev-a102-light" || dev == "dev-a102-light-1" || dev == "dev-a102-light-2") {
+  else if (dev == "l2" || dev == "light2" || dev == "dev-a102-light" ||
+           dev == "dev-a102-light-1" || dev == "dev-a102-light-2") {
     state_c2_light = st;
-  } else if (dev == "f2" || dev == "fan2" || dev == "dev-a102-fan" || dev == "dev-a102-fan-1" || dev == "dev-a102-fan-2") {
+  } else if (dev == "f2" || dev == "fan2" || dev == "dev-a102-fan" ||
+             dev == "dev-a102-fan-1" || dev == "dev-a102-fan-2") {
     state_c2_fan = st;
   } else if (dev == "c2" || dev == "curtain2" || dev == "dev-a102-curtain") {
     state_c2_curtain = st;
   }
   // Corridors
-  else if (dev == "cr1" || dev == "corridor1" || dev == "corr1" || dev == "dev-corr-light1" || dev == "dev-corr-light-1") {
+  else if (dev == "cr1" || dev == "corridor1" || dev == "corr1" ||
+           dev == "dev-corr-light1" || dev == "dev-corr-light-1") {
     state_corr1_light = st;
-  } else if (dev == "cr2" || dev == "corridor2" || dev == "corr2" || dev == "dev-corr-light2" || dev == "dev-corr-light-2") {
+  } else if (dev == "cr2" || dev == "corridor2" || dev == "corr2" ||
+             dev == "dev-corr-light2" || dev == "dev-corr-light-2") {
     state_corr2_light = st;
   }
   // Bulk / Emergency Commands
   else if (dev == "all" || dev == "emergency") {
-    state_c1_light    = st;
-    state_c1_fan      = st;
-    state_c1_curtain  = st;
-    state_c2_light    = st;
-    state_c2_fan      = st;
-    state_c2_curtain  = st;
+    state_c1_light = st;
+    state_c1_fan = st;
+    state_c1_curtain = st;
+    state_c2_light = st;
+    state_c2_fan = st;
+    state_c2_curtain = st;
     state_corr1_light = st;
     state_corr2_light = st;
   }
@@ -342,50 +626,90 @@ void applyDeviceControl(String dev, bool st) {
 void handleControl() {
   enableCORS();
 
-  // Any incoming manual control command immediately switches to manual override mode
-  if (isAutoMode) {
-    isAutoMode = false;
-    pendingModeCloudSync = true;
-    Serial.println(F("[SYSTEM] Manual command received -> Switched to MANUAL Mode"));
-  }
-
   // Handle Query Parameters (GET /ctrl?dev=l1&st=1)
   if (server.hasArg("dev") && server.arg("st")) {
     String dev = server.arg("dev");
-    bool st = (server.arg("st") == "1" || server.arg("st") == "true" || server.arg("st") == "on");
+    bool st = (server.arg("st") == "1" || server.arg("st") == "true" ||
+               server.arg("st") == "on");
+
+    // Valid manual command received: Switch to manual mode
+    if (isAutoMode) {
+      setSystemModeInternal(false, true);
+      Serial.println(
+          F("[SYSTEM] Manual command received -> Switched to MANUAL Mode"));
+    }
+
     applyDeviceControl(dev, st);
-    server.send(200, "application/json", "{\"status\":\"ok\",\"device\":\"" + dev + "\",\"state\":" + String(st ? "true" : "false") + "}");
+    server.send(200, "application/json",
+                "{\"status\":\"ok\",\"device\":\"" + dev +
+                    "\",\"state\":" + String(st ? "true" : "false") + "}");
     return;
   }
 
-  // Handle JSON POST Body (POST /api/control with {"dev":"l1","st":1})
+  // Handle JSON POST Body (POST /api/control with {"dev":"l1","st":1} or
+  // {"deviceId":"...","state":"..."})
   if (server.hasArg("plain")) {
     String body = server.arg("plain");
     String dev = "";
     bool st = false;
 
-    // Fast parser for {"dev":"...", "st":...} or {"deviceId":"...", "state":"..."}
-    int devIdx = body.indexOf("\"dev\":\"");
-    if (devIdx < 0) devIdx = body.indexOf("\"deviceId\":\"");
-    if (devIdx >= 0) {
-      int start = body.indexOf("\"", devIdx + 6) + 1;
-      int end = body.indexOf("\"", start);
-      dev = body.substring(start, end);
-    }
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, body);
+    if (!err) {
+      if (doc.containsKey("dev")) {
+        dev = doc["dev"].as<String>();
+      } else if (doc.containsKey("deviceId")) {
+        dev = doc["deviceId"].as<String>();
+      }
 
-    if (body.indexOf("\"st\":1") >= 0 || body.indexOf("\"st\":true") >= 0 || 
-        body.indexOf("\"state\":true") >= 0 || body.indexOf("\"state\":\"on\"") >= 0) {
-      st = true;
+      if (doc.containsKey("st")) {
+        st = doc["st"].as<bool>() || (doc["st"].as<int>() == 1);
+      } else if (doc.containsKey("state")) {
+        String stStr = doc["state"].as<String>();
+        st = (stStr == "1" || stStr == "true" || stStr == "on");
+      }
+    } else {
+      // Fallback substring search if JSON is malformed
+      if (body.indexOf("\"st\":1") >= 0 || body.indexOf("\"st\":true") >= 0 ||
+          body.indexOf("\"state\":true") >= 0 ||
+          body.indexOf("\"state\":\"on\"") >= 0) {
+        st = true;
+      }
+      int devIdx = body.indexOf("\"dev\":\"");
+      if (devIdx >= 0) {
+        int start = devIdx + 7;
+        int end = body.indexOf("\"", start);
+        if (end > start)
+          dev = body.substring(start, end);
+      } else {
+        int idIdx = body.indexOf("\"deviceId\":\"");
+        if (idIdx >= 0) {
+          int start = idIdx + 12;
+          int end = body.indexOf("\"", start);
+          if (end > start)
+            dev = body.substring(start, end);
+        }
+      }
     }
 
     if (dev.length() > 0) {
+      // Valid manual command received: Switch to manual mode
+      if (isAutoMode) {
+        setSystemModeInternal(false, true);
+        Serial.println(
+            F("[SYSTEM] Manual command received -> Switched to MANUAL Mode"));
+      }
       applyDeviceControl(dev, st);
-      server.send(200, "application/json", "{\"status\":\"ok\",\"device\":\"" + dev + "\",\"state\":" + String(st ? "true" : "false") + "}");
+      server.send(200, "application/json",
+                  "{\"status\":\"ok\",\"device\":\"" + dev +
+                      "\",\"state\":" + String(st ? "true" : "false") + "}");
       return;
     }
   }
 
-  server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing 'dev' and 'st' parameters\"}");
+  server.send(400, "application/json",
+              "{\"status\":\"error\",\"message\":\"Missing 'dev' and 'st' "
+              "parameters\"}");
 }
 
 // ==========================================
@@ -402,233 +726,63 @@ void handleConfig() {
   if (server.hasArg("hold_sec")) {
     currentHoldTime = server.arg("hold_sec").toInt() * 1000UL;
   }
+  if (server.hasArg("c1_light_w")) {
+    rated_c1_light = server.arg("c1_light_w").toFloat();
+    preferences.putFloat("r_c1_l", rated_c1_light);
+  }
+  if (server.hasArg("c1_fan_w")) {
+    rated_c1_fan = server.arg("c1_fan_w").toFloat();
+    preferences.putFloat("r_c1_f", rated_c1_fan);
+  }
+  if (server.hasArg("c2_light_w")) {
+    rated_c2_light = server.arg("c2_light_w").toFloat();
+    preferences.putFloat("r_c2_l", rated_c2_light);
+  }
+  if (server.hasArg("c2_fan_w")) {
+    rated_c2_fan = server.arg("c2_fan_w").toFloat();
+    preferences.putFloat("r_c2_f", rated_c2_fan);
+  }
+  if (server.hasArg("corr1_w")) {
+    rated_corr1 = server.arg("corr1_w").toFloat();
+    preferences.putFloat("r_cr1", rated_corr1);
+  }
+  if (server.hasArg("corr2_w")) {
+    rated_corr2 = server.arg("corr2_w").toFloat();
+    preferences.putFloat("r_cr2", rated_corr2);
+  }
 
   String json = "{";
   json += "\"status\":\"ok\",";
   json += "\"temp_threshold\":" + String(currentTempThreshold, 1) + ",";
   json += "\"ldr_threshold\":" + String(currentLdrThreshold) + ",";
-  json += "\"hold_time_ms\":" + String(currentHoldTime);
+  json += "\"hold_time_ms\":" + String(currentHoldTime) + ",";
+  json += "\"c1_light_w\":" + String(rated_c1_light, 1) + ",";
+  json += "\"c1_fan_w\":" + String(rated_c1_fan, 1);
   json += "}";
   server.send(200, "application/json", json);
 }
 
 // ==========================================
-// --- EMBEDDED WEB DASHBOARD (MOBILE-READY) ---
+// --- REST API: ROOT ---
 // ==========================================
-// Serves responsive web control center matching the mobile app palette
-const char PAGE_INDEX[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Smart Classroom IoT Controller</title>
-  <style>
-    :root {
-      --bg: #080908;
-      --card: #151615;
-      --card-border: #262826;
-      --primary: #FDA83A;
-      --text: #F3F4F6;
-      --text-muted: #9CA3AF;
-      --success: #22C55E;
-      --danger: #EF4444;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body { background-color: var(--bg); color: var(--text); padding: 16px; max-width: 600px; margin: 0 auto; }
-    header { display: flex; justify-content: space-between; align-items: center; padding: 12px 0 20px; border-bottom: 1px solid var(--card-border); margin-bottom: 20px; }
-    h1 { font-size: 20px; font-weight: 700; color: var(--primary); }
-    .badge { padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; text-transform: uppercase; cursor: pointer; }
-    .badge-auto { background: rgba(34, 197, 94, 0.15); color: var(--success); border: 1px solid var(--success); }
-    .badge-manual { background: rgba(253, 168, 58, 0.15); color: var(--primary); border: 1px solid var(--primary); }
-    
-    .stats-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 20px; }
-    .stat-card { background: var(--card); border: 1px solid var(--card-border); border-radius: 16px; padding: 12px; text-align: center; }
-    .stat-val { font-size: 20px; font-weight: 700; color: var(--primary); margin-top: 4px; }
-    .stat-lbl { font-size: 11px; color: var(--text-muted); text-transform: uppercase; }
-
-    .room-card { background: var(--card); border: 1px solid var(--card-border); border-radius: 20px; padding: 16px; margin-bottom: 16px; }
-    .room-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
-    .room-title { font-size: 16px; font-weight: 600; }
-    .occ-pill { font-size: 11px; padding: 3px 8px; border-radius: 12px; font-weight: 600; }
-    .occ-occupied { background: rgba(34, 197, 94, 0.2); color: var(--success); }
-    .occ-vacant { background: rgba(156, 163, 175, 0.2); color: var(--text-muted); }
-
-    .ctrl-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-top: 1px solid rgba(255,255,255,0.05); }
-    .ctrl-label { font-size: 14px; color: var(--text); }
-    .toggle { position: relative; display: inline-block; width: 48px; height: 26px; }
-    .toggle input { opacity: 0; width: 0; height: 0; }
-    .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #2b2b2b; transition: .3s; border-radius: 26px; }
-    .slider:before { position: absolute; content: ""; height: 20px; width: 20px; left: 3px; bottom: 3px; background-color: white; transition: .3s; border-radius: 50%; }
-    input:checked + .slider { background-color: var(--primary); }
-    input:checked + .slider:before { transform: translateX(22px); }
-
-    .btn-emergency { width: 100%; background: rgba(239, 68, 68, 0.15); border: 1px solid var(--danger); color: var(--danger); padding: 12px; border-radius: 14px; font-weight: 700; cursor: pointer; margin-top: 10px; }
-    .btn-emergency:hover { background: var(--danger); color: white; }
-    .footer { text-align: center; font-size: 11px; color: var(--text-muted); margin-top: 24px; padding-bottom: 12px; }
-  </style>
-</head>
-<body>
-  <header>
-    <div>
-      <h1>NBA Smart Classroom</h1>
-      <div style="font-size: 12px; color: var(--text-muted); margin-top: 2px;">Dual Zone Controller (ESP32)</div>
-    </div>
-    <div id="modeBtn" class="badge badge-auto" onclick="toggleMode()">AUTO</div>
-  </header>
-
-  <div class="stats-grid">
-    <div class="stat-card">
-      <div class="stat-lbl">Temp</div>
-      <div class="stat-val" id="tempVal">--.-°C</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-lbl">Humidity</div>
-      <div class="stat-val" id="humVal">--%</div>
-    </div>
-    <div class="stat-card">
-      <div class="stat-lbl">Load</div>
-      <div class="stat-val" id="loadVal">-- W</div>
-    </div>
-  </div>
-
-  <!-- Classroom 1 -->
-  <div class="room-card">
-    <div class="room-header">
-      <div class="room-title">Classroom A101</div>
-      <span class="occ-pill occ-vacant" id="c1Occ">VACANT</span>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Main Lights</span>
-      <label class="toggle"><input type="checkbox" id="l1" onchange="ctrl('l1', this.checked)"><span class="slider"></span></label>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Ceiling Fan</span>
-      <label class="toggle"><input type="checkbox" id="f1" onchange="ctrl('f1', this.checked)"><span class="slider"></span></label>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Curtain (Servo 1)</span>
-      <label class="toggle"><input type="checkbox" id="c1" onchange="ctrl('c1', this.checked)"><span class="slider"></span></label>
-    </div>
-  </div>
-
-  <!-- Classroom 2 -->
-  <div class="room-card">
-    <div class="room-header">
-      <div class="room-title">Classroom A102</div>
-      <span class="occ-pill occ-vacant" id="c2Occ">VACANT</span>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Main Lights</span>
-      <label class="toggle"><input type="checkbox" id="l2" onchange="ctrl('l2', this.checked)"><span class="slider"></span></label>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Ceiling Fan</span>
-      <label class="toggle"><input type="checkbox" id="f2" onchange="ctrl('f2', this.checked)"><span class="slider"></span></label>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Curtain (Servo 2)</span>
-      <label class="toggle"><input type="checkbox" id="c2" onchange="ctrl('c2', this.checked)"><span class="slider"></span></label>
-    </div>
-  </div>
-
-  <!-- Corridors -->
-  <div class="room-card">
-    <div class="room-header">
-      <div class="room-title">Corridor Lighting</div>
-      <span style="font-size: 12px; color: var(--text-muted);" id="ldrVal">LDR: --</span>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Corridor Light 1</span>
-      <label class="toggle"><input type="checkbox" id="cr1" onchange="ctrl('cr1', this.checked)"><span class="slider"></span></label>
-    </div>
-    <div class="ctrl-row">
-      <span class="ctrl-label">Corridor Light 2</span>
-      <label class="toggle"><input type="checkbox" id="cr2" onchange="ctrl('cr2', this.checked)"><span class="slider"></span></label>
-    </div>
-  </div>
-
-  <button class="btn-emergency" onclick="emergencyOff()">EMERGENCY ALL OFF</button>
-  <div class="footer" id="footerInfo">Connecting to ESP32...</div>
-
-  <script>
-    let currentMode = 'auto';
-
-    async function poll() {
-      try {
-        const res = await fetch('/status');
-        const data = await res.json();
-        
-        currentMode = data.mode;
-        const mb = document.getElementById('modeBtn');
-        mb.innerText = currentMode.toUpperCase();
-        mb.className = 'badge ' + (currentMode === 'auto' ? 'badge-auto' : 'badge-manual');
-
-        document.getElementById('tempVal').innerText = data.temperature.toFixed(1) + '°C';
-        document.getElementById('humVal').innerText = Math.round(data.humidity) + '%';
-        document.getElementById('loadVal').innerText = Math.round(data.total_load_watts) + ' W';
-
-        // C1
-        document.getElementById('c1Occ').innerText = data.classroom1.occupied ? 'OCCUPIED' : 'VACANT';
-        document.getElementById('c1Occ').className = 'occ-pill ' + (data.classroom1.occupied ? 'occ-occupied' : 'occ-vacant');
-        document.getElementById('l1').checked = data.classroom1.light;
-        document.getElementById('f1').checked = data.classroom1.fan;
-        document.getElementById('c1').checked = data.classroom1.curtain;
-
-        // C2
-        document.getElementById('c2Occ').innerText = data.classroom2.occupied ? 'OCCUPIED' : 'VACANT';
-        document.getElementById('c2Occ').className = 'occ-pill ' + (data.classroom2.occupied ? 'occ-occupied' : 'occ-vacant');
-        document.getElementById('l2').checked = data.classroom2.light;
-        document.getElementById('f2').checked = data.classroom2.fan;
-        document.getElementById('c2').checked = data.classroom2.curtain;
-
-        // Corridors
-        document.getElementById('cr1').checked = data.corridors.light1;
-        document.getElementById('cr2').checked = data.corridors.light2;
-        document.getElementById('ldrVal').innerText = 'LDR1: ' + data.corridors.ldr1_raw + ' | LDR2: ' + data.corridors.ldr2_raw;
-
-        if (data.controller) {
-          document.getElementById('footerInfo').innerText = 'IP: ' + data.controller.ip + ' | RSSI: ' + data.controller.rssi + ' dBm | FW: v' + data.controller.firmware;
-        }
-      } catch (e) {
-        document.getElementById('footerInfo').innerText = 'Connection lost. Reconnecting...';
-      }
-    }
-
-    async function ctrl(dev, state) {
-      await fetch('/ctrl?dev=' + dev + '&st=' + (state ? 1 : 0) + '&force=1');
-      poll();
-    }
-
-    async function toggleMode() {
-      const target = currentMode === 'auto' ? 0 : 1;
-      await fetch('/mode?auto=' + target);
-      poll();
-    }
-
-    async function emergencyOff() {
-      await fetch('/ctrl?dev=all&st=0&force=1');
-      poll();
-    }
-
-    setInterval(poll, 1500);
-    poll();
-  </script>
-</body>
-</html>
-)rawliteral";
-
 void handleRoot() {
-  server.send_P(200, "text/html", PAGE_INDEX);
+  enableCORS();
+  server.send(200, "application/json",
+              "{\"system\":\"NBA Smart Classroom Controller\",\"firmware\":\"" +
+                  String(FIRMWARE_VERSION) + "\",\"status\":\"online\"}");
 }
 
 // Forward declaration for FreeRTOS background cloud task
-void supabaseCloudTask(void* pvParameters);
+void supabaseCloudTask(void *pvParameters);
 
 // ==========================================
 // --- SETUP INITIALIZATION ---
 // ==========================================
 void setup() {
+  // 0. Disable Hardware Brownout Detector so momentary coil/servo inrush
+  // currents don't cause CPU reset
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
   Serial.begin(115200);
   delay(200);
   Serial.println(F("\n=============================================="));
@@ -636,12 +790,35 @@ void setup() {
   Serial.printf(F(" Firmware Version: %s\n"), FIRMWARE_VERSION);
   Serial.println(F("=============================================="));
 
+  // Initialize NVS Preferences to restore persistent system mode & energy
+  // across boots
+  preferences.begin("nba_scr", false);
+  isAutoMode = preferences.getBool("auto_mode", false);
+  c1_accumulated_kwh = preferences.getFloat("c1_kwh", 0.0f);
+  c2_accumulated_kwh = preferences.getFloat("c2_kwh", 0.0f);
+  rated_c1_light = preferences.getFloat("r_c1_l", WATTS_CLASS_LIGHT);
+  rated_c1_fan = preferences.getFloat("r_c1_f", WATTS_CLASS_FAN);
+  rated_c2_light = preferences.getFloat("r_c2_l", WATTS_CLASS_LIGHT);
+  rated_c2_fan = preferences.getFloat("r_c2_f", WATTS_CLASS_FAN);
+  rated_corr1 = preferences.getFloat("r_cr1", WATTS_CORR_LIGHT);
+  rated_corr2 = preferences.getFloat("r_cr2", WATTS_CORR_LIGHT);
+  cloud_prev_system_auto = isAutoMode;
+  Serial.printf("[SYSTEM] Boot System Mode: %s | Restored Energy: C1=%.4f kWh, "
+                "C2=%.4f kWh\n",
+                isAutoMode ? "AUTO" : "MANUAL", (float)c1_accumulated_kwh,
+                (float)c2_accumulated_kwh);
+
+  // Sync NTP Time (IST +5:30)
+  configTime(19800, 0, "pool.ntp.org", "time.google.com");
+
   // 1. Initialize Sensor Pins
   dht.begin();
   pinMode(PIR1_PIN, INPUT_PULLDOWN);
   pinMode(PIR2_PIN, INPUT_PULLDOWN);
   pinMode(LDR_CORRIDOR1_PIN, INPUT);
   pinMode(LDR_CORRIDOR2_PIN, INPUT);
+  pinMode(ACS712_CURRENT_PIN, INPUT);
+  pinMode(ZMPT101B_VOLTAGE_PIN, INPUT);
 
   // 2. Initialize Relay Output Pins
   pinMode(RELAY_CLASS_LIGHT1, OUTPUT);
@@ -651,7 +828,13 @@ void setup() {
   pinMode(RELAY_CORRIDOR_LIGHT1, OUTPUT);
   pinMode(RELAY_CORRIDOR_LIGHT2, OUTPUT);
 
-  // Start with all relays explicitly in safe OFF state
+  // Explicitly initialize relay pins to OFF before attaching loads
+  digitalWrite(RELAY_CLASS_LIGHT1, RELAY_OFF);
+  digitalWrite(RELAY_CLASS_FAN1, RELAY_OFF);
+  digitalWrite(RELAY_CLASS_LIGHT2, RELAY_OFF);
+  digitalWrite(RELAY_CLASS_FAN2, RELAY_OFF);
+  digitalWrite(RELAY_CORRIDOR_LIGHT1, RELAY_OFF);
+  digitalWrite(RELAY_CORRIDOR_LIGHT2, RELAY_OFF);
   applyRelayStates();
 
   // 3. Initialize Servos (Closed position)
@@ -679,7 +862,8 @@ void setup() {
     display.println(F("Connecting Wi-Fi..."));
     display.display();
   } else {
-    Serial.println(F("[WARN] OLED SSD1306 allocation failed (check SDA/SCL pins)"));
+    Serial.println(
+        F("[WARN] OLED SSD1306 allocation failed (check SDA/SCL pins)"));
   }
 
   // 5. Connect to Wi-Fi
@@ -703,7 +887,8 @@ void setup() {
       MDNS.addService("http", "tcp", WEB_SERVER_PORT);
     }
   } else {
-    Serial.println(F("\n[WARN] Wi-Fi connection timed out. Starting offline demo mode."));
+    Serial.println(
+        F("\n[WARN] Wi-Fi connection timed out. Starting offline demo mode."));
   }
 
   // 7. Update OLED with IP
@@ -722,33 +907,25 @@ void setup() {
     delay(2000);
   }
 
-  // 8. Register REST API Handlers
-  server.on("/", HTTP_GET, handleRoot);              // Web dashboard
-  server.on("/web", HTTP_GET, handleRoot);
-  server.on("/status", HTTP_GET, handleStatus);      // Backward compatible status
-  server.on("/api/status", HTTP_GET, handleStatus);  // Enhanced REST status
-  server.on("/mode", HTTP_GET, handleMode);          // Mode toggle
+  // 8. Register REST API Handlers (App JSON Interface)
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);     // Status endpoint for App
+  server.on("/api/status", HTTP_GET, handleStatus); // Enhanced REST status
+  server.on("/mode", HTTP_GET, handleMode);         // Mode toggle
   server.on("/api/mode", HTTP_ANY, handleMode);
-  server.on("/ctrl", HTTP_GET, handleControl);       // Device control
+  server.on("/ctrl", HTTP_GET, handleControl); // Device control
   server.on("/api/control", HTTP_ANY, handleControl);
-  server.on("/config", HTTP_GET, handleConfig);      // Threshold adjustments
+  server.on("/config", HTTP_GET, handleConfig); // Threshold adjustments
   server.on("/api/config", HTTP_ANY, handleConfig);
 
-  server.onNotFound(handleOptions);                  // Handle CORS preflight & 404s
+  server.onNotFound(handleOptions); // Handle CORS preflight & 404s
   server.begin();
   Serial.println(F("[OK] HTTP API Server Started"));
 
   // 9. Launch Supabase Cloud Task on Core 0 (Background)
   // 16KB stack space ensures safe mbedTLS execution without stack overflow
-  xTaskCreatePinnedToCore(
-    supabaseCloudTask,
-    "SupabaseCloudTask",
-    16384,
-    NULL,
-    1,
-    NULL,
-    0
-  );
+  xTaskCreatePinnedToCore(supabaseCloudTask, "SupabaseCloudTask", 16384, NULL,
+                          1, NULL, 0);
   Serial.println(F("[OK] Supabase Cloud Background Task started on Core 0"));
 }
 
@@ -760,28 +937,43 @@ unsigned long lastSupabaseTelemetry = 0;
 bool supabaseSyncActive = false;
 
 void syncWithSupabase() {
-  if (WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED)
+    return;
   unsigned long now = millis();
 
-  // 0. Sync System Mode to Cloud if changed locally
+  // 0. Sync System Mode to Cloud if changed locally (with retry on failure)
   if (pendingModeCloudSync) {
-    pendingModeCloudSync = false;
     WiFiClientSecure mClient;
     mClient.setInsecure();
-    mClient.setTimeout(5000);
+    mClient.setTimeout(4000);
     HTTPClient mHttps;
-    mHttps.setTimeout(5000);
-    String urlMode = String(SUPABASE_URL) + "/rest/v1/devices?id=eq.dev-system-mode";
+    mHttps.setTimeout(4000);
+    String urlMode =
+        String(SUPABASE_URL) + "/rest/v1/devices?id=eq.dev-system-mode";
     if (mHttps.begin(mClient, urlMode)) {
       mHttps.addHeader("apikey", SUPABASE_KEY);
       mHttps.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
       mHttps.addHeader("Content-Type", "application/json");
       mHttps.addHeader("Prefer", "return=minimal");
-      String body = "{\"status\":\"" + String(isAutoMode ? "auto" : "manual") + "\"}";
-      mHttps.sendRequest("PATCH", body);
+      String body =
+          "{\"status\":\"" + String(isAutoMode ? "auto" : "manual") + "\"}";
+      int httpRes = mHttps.sendRequest("PATCH", body);
+      if (httpRes >= 200 && httpRes < 300) {
+        pendingModeCloudSync = false;
+        cloud_prev_system_auto = isAutoMode;
+        Serial.printf("[SUPABASE] Successfully synced system mode '%s' to "
+                      "cloud (HTTP %d)\n",
+                      isAutoMode ? "auto" : "manual", httpRes);
+      } else {
+        Serial.printf(
+            "[SUPABASE WARN] System mode sync failed (HTTP %d). Retrying.\n",
+            httpRes);
+      }
       mHttps.end();
       mClient.stop();
     }
+    lastSupabasePoll =
+        now; // Delay next GET poll slightly so Supabase DB commit settles
   }
 
   // 1. Fetch Remote Device Commands from Supabase (Every 1000ms)
@@ -789,8 +981,9 @@ void syncWithSupabase() {
     lastSupabasePoll = now;
 
     WiFiClientSecure client;
-    client.setInsecure();    // Supabase HTTPS
-    client.setTimeout(5000); // 5000ms socket timeout (allows TLS handshake over Internet)
+    client.setInsecure(); // Supabase HTTPS
+    client.setTimeout(
+        5000); // 5000ms socket timeout (allows TLS handshake over Internet)
 
     HTTPClient https;
     https.setTimeout(5000);
@@ -810,101 +1003,182 @@ void syncWithSupabase() {
         if (!err && doc.is<JsonArray>()) {
           bool anyStateChanged = false;
           for (JsonObject dev : doc.as<JsonArray>()) {
-            const char* id = dev["id"];
-            const char* st = dev["status"];
-            if (!id || !st) continue;
+            const char *id = dev["id"];
+            const char *st = dev["status"];
+            if (!id || !st)
+              continue;
 
-            // 1. System Mode command from Cloud
+            // 1. System Mode command from Cloud (with anti-echo shield)
             if (strcmp(id, "dev-system-mode") == 0) {
               bool cloudAuto = (strcmp(st, "auto") == 0);
-              if (isAutoMode != cloudAuto) {
-                isAutoMode = cloudAuto;
-                Serial.printf("[SYSTEM] Mode changed via Cloud -> %s\n", isAutoMode ? "AUTO" : "MANUAL");
+
+              // Anti-echo protection: Ignore cloud command for 15 seconds after
+              // a local change
+              if (now - lastLocalModeChange < 15000) {
+                continue;
+              }
+
+              if (!cloud_initialized) {
+                cloud_prev_system_auto = cloudAuto;
+                // If boot NVS preference differs from cloud, enforce local NVS
+                // over stale cloud!
+                if (cloudAuto != isAutoMode) {
+                  pendingModeCloudSync = true;
+                  lastLocalModeChange = now;
+                  Serial.printf("[SYSTEM] Pushing persistent NVS mode '%s' to "
+                                "replace stale cloud '%s'\n",
+                                isAutoMode ? "AUTO" : "MANUAL",
+                                cloudAuto ? "AUTO" : "MANUAL");
+                }
+              } else if (cloudAuto != cloud_prev_system_auto) {
+                cloud_prev_system_auto = cloudAuto;
+                setSystemModeInternal(cloudAuto, false);
+                Serial.printf("[SYSTEM] Mode changed via Cloud -> %s\n",
+                              isAutoMode ? "AUTO" : "MANUAL");
               }
               continue;
             }
 
             bool isOn = (strcmp(st, "on") == 0);
 
-            // On first boot, record baseline cloud states without triggering actions
+            // On first boot, record baseline cloud states without triggering
+            // actions
             if (!cloud_initialized) {
-              if (strcmp(id, "dev-a101-light-1") == 0 || strcmp(id, "dev-a101-light") == 0) cloud_prev_c1_light = isOn;
-              else if (strcmp(id, "dev-a101-fan-1") == 0 || strcmp(id, "dev-a101-fan") == 0) cloud_prev_c1_fan = isOn;
-              else if (strcmp(id, "dev-a101-curtain") == 0) cloud_prev_c1_curtain = isOn;
-              else if (strcmp(id, "dev-a102-light-1") == 0 || strcmp(id, "dev-a102-light") == 0) cloud_prev_c2_light = isOn;
-              else if (strcmp(id, "dev-a102-fan-1") == 0 || strcmp(id, "dev-a102-fan") == 0) cloud_prev_c2_fan = isOn;
-              else if (strcmp(id, "dev-a102-curtain") == 0) cloud_prev_c2_curtain = isOn;
-              else if (strcmp(id, "dev-corr-light-1") == 0 || strcmp(id, "dev-corr-light1") == 0) cloud_prev_corr1_light = isOn;
-              else if (strcmp(id, "dev-corr-light-2") == 0 || strcmp(id, "dev-corr-light2") == 0) cloud_prev_corr2_light = isOn;
+              if (strcmp(id, "dev-a101-light-1") == 0 ||
+                  strcmp(id, "dev-a101-light") == 0)
+                cloud_prev_c1_light = isOn;
+              else if (strcmp(id, "dev-a101-fan-1") == 0 ||
+                       strcmp(id, "dev-a101-fan") == 0)
+                cloud_prev_c1_fan = isOn;
+              else if (strcmp(id, "dev-a101-curtain") == 0)
+                cloud_prev_c1_curtain = isOn;
+              else if (strcmp(id, "dev-a102-light-1") == 0 ||
+                       strcmp(id, "dev-a102-light") == 0)
+                cloud_prev_c2_light = isOn;
+              else if (strcmp(id, "dev-a102-fan-1") == 0 ||
+                       strcmp(id, "dev-a102-fan") == 0)
+                cloud_prev_c2_fan = isOn;
+              else if (strcmp(id, "dev-a102-curtain") == 0)
+                cloud_prev_c2_curtain = isOn;
+              else if (strcmp(id, "dev-corr-light-1") == 0 ||
+                       strcmp(id, "dev-corr-light1") == 0)
+                cloud_prev_corr1_light = isOn;
+              else if (strcmp(id, "dev-corr-light-2") == 0 ||
+                       strcmp(id, "dev-corr-light2") == 0)
+                cloud_prev_corr2_light = isOn;
               continue;
             }
 
-            // Differential Tracking: Only act if cloud state actually changed (isOn != cloud_prev_*)
-            // This prevents stale database rows from overriding local PIR/LDR sensor decisions!
-            if (strcmp(id, "dev-a101-light-1") == 0 || strcmp(id, "dev-a101-light") == 0) {
-              if (isOn != cloud_prev_c1_light) {
+            // Differential Tracking:
+            // CRITICAL: When isAutoMode == true, the local sensors have
+            // exclusive authority over relay states. Device polling only
+            // updates baseline tracking; it NEVER overrides local sensor relays
+            // and NEVER disarms Auto Mode! When in Manual Mode (!isAutoMode),
+            // incoming cloud changes actuate relays.
+            if (!isAutoMode) {
+              if (strcmp(id, "dev-a101-light-1") == 0 ||
+                  strcmp(id, "dev-a101-light") == 0) {
+                if (isOn != cloud_prev_c1_light) {
+                  cloud_prev_c1_light = isOn;
+                  state_c1_light = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] A101 Light -> %s\n",
+                                isOn ? "ON" : "OFF");
+                }
+              } else if (strcmp(id, "dev-a101-fan-1") == 0 ||
+                         strcmp(id, "dev-a101-fan") == 0) {
+                if (isOn != cloud_prev_c1_fan) {
+                  cloud_prev_c1_fan = isOn;
+                  state_c1_fan = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] A101 Fan -> %s\n",
+                                isOn ? "ON" : "OFF");
+                }
+              } else if (strcmp(id, "dev-a101-curtain") == 0) {
+                if (isOn != cloud_prev_c1_curtain) {
+                  cloud_prev_c1_curtain = isOn;
+                  state_c1_curtain = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] A101 Curtain -> %s\n",
+                                isOn ? "OPEN" : "CLOSED");
+                }
+              } else if (strcmp(id, "dev-a102-light-1") == 0 ||
+                         strcmp(id, "dev-a102-light") == 0) {
+                if (isOn != cloud_prev_c2_light) {
+                  cloud_prev_c2_light = isOn;
+                  state_c2_light = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] A102 Light -> %s\n",
+                                isOn ? "ON" : "OFF");
+                }
+              } else if (strcmp(id, "dev-a102-fan-1") == 0 ||
+                         strcmp(id, "dev-a102-fan") == 0) {
+                if (isOn != cloud_prev_c2_fan) {
+                  cloud_prev_c2_fan = isOn;
+                  state_c2_fan = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] A102 Fan -> %s\n",
+                                isOn ? "ON" : "OFF");
+                }
+              } else if (strcmp(id, "dev-a102-curtain") == 0) {
+                if (isOn != cloud_prev_c2_curtain) {
+                  cloud_prev_c2_curtain = isOn;
+                  state_c2_curtain = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] A102 Curtain -> %s\n",
+                                isOn ? "OPEN" : "CLOSED");
+                }
+              } else if (strcmp(id, "dev-corr-light-1") == 0 ||
+                         strcmp(id, "dev-corr-light1") == 0) {
+                if (isOn != cloud_prev_corr1_light) {
+                  cloud_prev_corr1_light = isOn;
+                  state_corr1_light = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] Corridor 1 Light -> %s\n",
+                                isOn ? "ON" : "OFF");
+                }
+              } else if (strcmp(id, "dev-corr-light-2") == 0 ||
+                         strcmp(id, "dev-corr-light2") == 0) {
+                if (isOn != cloud_prev_corr2_light) {
+                  cloud_prev_corr2_light = isOn;
+                  state_corr2_light = isOn;
+                  anyStateChanged = true;
+                  Serial.printf("[MANUAL COMMAND] Corridor 2 Light -> %s\n",
+                                isOn ? "ON" : "OFF");
+                }
+              }
+            } else {
+              // In Auto Mode: keep baseline in sync so switching to Manual
+              // later has no stale echo
+              if (strcmp(id, "dev-a101-light-1") == 0 ||
+                  strcmp(id, "dev-a101-light") == 0)
                 cloud_prev_c1_light = isOn;
-                state_c1_light = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] A101 Light -> %s\n", isOn ? "ON" : "OFF");
-              }
-            } else if (strcmp(id, "dev-a101-fan-1") == 0 || strcmp(id, "dev-a101-fan") == 0) {
-              if (isOn != cloud_prev_c1_fan) {
+              else if (strcmp(id, "dev-a101-fan-1") == 0 ||
+                       strcmp(id, "dev-a101-fan") == 0)
                 cloud_prev_c1_fan = isOn;
-                state_c1_fan = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] A101 Fan -> %s\n", isOn ? "ON" : "OFF");
-              }
-            } else if (strcmp(id, "dev-a101-curtain") == 0) {
-              if (isOn != cloud_prev_c1_curtain) {
+              else if (strcmp(id, "dev-a101-curtain") == 0)
                 cloud_prev_c1_curtain = isOn;
-                state_c1_curtain = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] A101 Curtain -> %s\n", isOn ? "OPEN" : "CLOSED");
-              }
-            } else if (strcmp(id, "dev-a102-light-1") == 0 || strcmp(id, "dev-a102-light") == 0) {
-              if (isOn != cloud_prev_c2_light) {
+              else if (strcmp(id, "dev-a102-light-1") == 0 ||
+                       strcmp(id, "dev-a102-light") == 0)
                 cloud_prev_c2_light = isOn;
-                state_c2_light = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] A102 Light -> %s\n", isOn ? "ON" : "OFF");
-              }
-            } else if (strcmp(id, "dev-a102-fan-1") == 0 || strcmp(id, "dev-a102-fan") == 0) {
-              if (isOn != cloud_prev_c2_fan) {
+              else if (strcmp(id, "dev-a102-fan-1") == 0 ||
+                       strcmp(id, "dev-a102-fan") == 0)
                 cloud_prev_c2_fan = isOn;
-                state_c2_fan = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] A102 Fan -> %s\n", isOn ? "ON" : "OFF");
-              }
-            } else if (strcmp(id, "dev-a102-curtain") == 0) {
-              if (isOn != cloud_prev_c2_curtain) {
+              else if (strcmp(id, "dev-a102-curtain") == 0)
                 cloud_prev_c2_curtain = isOn;
-                state_c2_curtain = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] A102 Curtain -> %s\n", isOn ? "OPEN" : "CLOSED");
-              }
-            } else if (strcmp(id, "dev-corr-light-1") == 0 || strcmp(id, "dev-corr-light1") == 0) {
-              if (isOn != cloud_prev_corr1_light) {
+              else if (strcmp(id, "dev-corr-light-1") == 0 ||
+                       strcmp(id, "dev-corr-light1") == 0)
                 cloud_prev_corr1_light = isOn;
-                state_corr1_light = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] Corridor 1 Light -> %s\n", isOn ? "ON" : "OFF");
-              }
-            } else if (strcmp(id, "dev-corr-light-2") == 0 || strcmp(id, "dev-corr-light2") == 0) {
-              if (isOn != cloud_prev_corr2_light) {
+              else if (strcmp(id, "dev-corr-light-2") == 0 ||
+                       strcmp(id, "dev-corr-light2") == 0)
                 cloud_prev_corr2_light = isOn;
-                state_corr2_light = isOn;
-                anyStateChanged = true;
-                Serial.printf("[MANUAL OVERRIDE] Corridor 2 Light -> %s\n", isOn ? "ON" : "OFF");
-              }
             }
           }
 
-          if (!cloud_initialized) cloud_initialized = true;
+          if (!cloud_initialized)
+            cloud_initialized = true;
 
           if (anyStateChanged) {
-            isAutoMode = false; // Disarm auto mode upon intentional manual command
-            pendingModeCloudSync = true;
             applyRelayStates();
           }
         }
@@ -912,7 +1186,8 @@ void syncWithSupabase() {
         supabaseSyncActive = false;
         static unsigned long lastErr = 0;
         if (millis() - lastErr > 6000) {
-          Serial.printf("[SUPABASE ERROR] GET devices HTTP %d: %s\n", httpCode, https.errorToString(httpCode).c_str());
+          Serial.printf("[SUPABASE ERROR] GET devices HTTP %d: %s\n", httpCode,
+                        https.errorToString(httpCode).c_str());
           lastErr = millis();
         }
       }
@@ -921,7 +1196,8 @@ void syncWithSupabase() {
     }
   }
 
-  // 2. Push Sensor & Occupancy Telemetry to Supabase (Alternate cycle - prevents TLS memory collision)
+  // 2. Push Sensor & Occupancy Telemetry to Supabase (Alternate cycle -
+  // prevents TLS memory collision)
   else if (now - lastSupabaseTelemetry >= SUPABASE_TELEMETRY_INTERVAL_MS) {
     lastSupabaseTelemetry = now;
     static int telemetryStep = 0;
@@ -934,55 +1210,68 @@ void syncWithSupabase() {
 
     if (telemetryStep == 0) {
       // Slot 0: Classroom A101 Telemetry
-      String urlA101 = String(SUPABASE_URL) + "/rest/v1/classrooms?id=eq.cls-a101";
+      String urlA101 =
+          String(SUPABASE_URL) + "/rest/v1/classrooms?id=eq.cls-a101";
       if (https.begin(client, urlA101)) {
         https.addHeader("apikey", SUPABASE_KEY);
         https.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
         https.addHeader("Content-Type", "application/json");
         https.addHeader("Prefer", "return=minimal");
 
-        String body = "{\"temperature\":" + String(currentTemp, 1) + 
-                      ",\"occupancy_status\":\"" + String(c1_occupied ? "occupied" : "vacant") + 
-                      "\",\"current_load\":" + String(getC1LoadWatts(), 1) + 
-                      ",\"status\":\"online\"}";
+        String body =
+            "{\"temperature\":" + String(currentTemp, 1) +
+            ",\"occupancy_status\":\"" +
+            String(c1_occupied ? "occupied" : "vacant") +
+            "\",\"current_load\":" + String(getC1LoadWatts(), 1) +
+            ",\"energy_today\":" + String(c1_accumulated_kwh, 4) +
+            ",\"estimated_cost\":" + String(c1_accumulated_kwh * 8.0, 2) +
+            ",\"status\":\"online\"}";
         https.sendRequest("PATCH", body);
         https.end();
         client.stop();
       }
     } else if (telemetryStep == 1) {
       // Slot 1: Classroom A102 Telemetry
-      String urlA102 = String(SUPABASE_URL) + "/rest/v1/classrooms?id=eq.cls-a102";
+      String urlA102 =
+          String(SUPABASE_URL) + "/rest/v1/classrooms?id=eq.cls-a102";
       if (https.begin(client, urlA102)) {
         https.addHeader("apikey", SUPABASE_KEY);
         https.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
         https.addHeader("Content-Type", "application/json");
         https.addHeader("Prefer", "return=minimal");
 
-        String body = "{\"temperature\":" + String(currentTemp, 1) + 
-                      ",\"occupancy_status\":\"" + String(c2_occupied ? "occupied" : "vacant") + 
-                      "\",\"current_load\":" + String(getC2LoadWatts(), 1) + 
-                      ",\"status\":\"online\"}";
+        String body =
+            "{\"temperature\":" + String(currentTemp, 1) +
+            ",\"occupancy_status\":\"" +
+            String(c2_occupied ? "occupied" : "vacant") +
+            "\",\"current_load\":" + String(getC2LoadWatts(), 1) +
+            ",\"energy_today\":" + String(c2_accumulated_kwh, 4) +
+            ",\"estimated_cost\":" + String(c2_accumulated_kwh * 8.0, 2) +
+            ",\"status\":\"online\"}";
         https.sendRequest("PATCH", body);
         https.end();
         client.stop();
       }
     } else if (telemetryStep == 2) {
       // Slot 2: Corridors Telemetry
-      String urlCorr = String(SUPABASE_URL) + "/rest/v1/classrooms?id=eq.cls-corridor";
+      String urlCorr =
+          String(SUPABASE_URL) + "/rest/v1/classrooms?id=eq.cls-corridor";
       if (https.begin(client, urlCorr)) {
         https.addHeader("apikey", SUPABASE_KEY);
         https.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
         https.addHeader("Content-Type", "application/json");
         https.addHeader("Prefer", "return=minimal");
 
-        String body = "{\"current_load\":" + String(getCorrLoadWatts(), 1) + ",\"status\":\"online\"}";
+        String body = "{\"current_load\":" + String(getCorrLoadWatts(), 1) +
+                      ",\"status\":\"online\"}";
         https.sendRequest("PATCH", body);
         https.end();
         client.stop();
       }
     } else {
       // Slot 3: Controller Heartbeat & Live IP
-      String urlCtrl = String(SUPABASE_URL) + "/rest/v1/controllers?id=eq.ctrl-esp32";
+      String urlCtrl =
+          String(SUPABASE_URL) + "/rest/v1/controllers?id=eq.ctrl-esp32";
       if (https.begin(client, urlCtrl)) {
         https.addHeader("apikey", SUPABASE_KEY);
         https.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
@@ -991,9 +1280,10 @@ void syncWithSupabase() {
 
         int rssi = WiFi.RSSI();
         String sig = (rssi > -60) ? "strong" : (rssi > -75) ? "medium" : "weak";
-        String body = "{\"status\":\"online\",\"signal_strength\":\"" + sig + 
-                      "\",\"ip_address\":\"" + WiFi.localIP().toString() + 
-                      "\",\"firmware_version\":\"" + String(FIRMWARE_VERSION) + "\"}";
+        String body = "{\"status\":\"online\",\"signal_strength\":\"" + sig +
+                      "\",\"ip_address\":\"" + WiFi.localIP().toString() +
+                      "\",\"firmware_version\":\"" + String(FIRMWARE_VERSION) +
+                      "\"}";
         https.sendRequest("PATCH", body);
         https.end();
         client.stop();
@@ -1005,11 +1295,13 @@ void syncWithSupabase() {
 }
 
 // Dedicated FreeRTOS background task running on Core 0
-// Ensures cloud HTTPS polling NEVER blocks Core 1's local HTTP REST API / relay actuation!
-void supabaseCloudTask(void* pvParameters) {
+// Ensures cloud HTTPS polling NEVER blocks Core 1's local HTTP REST API / relay
+// actuation!
+void supabaseCloudTask(void *pvParameters) {
   vTaskDelay(pdMS_TO_TICKS(1500)); // Allow Wi-Fi to stabilize
   for (;;) {
-    if (WiFi.status() == WL_CONNECTED && strlen(SUPABASE_URL) > 0 && strlen(SUPABASE_KEY) > 0) {
+    if (WiFi.status() == WL_CONNECTED && strlen(SUPABASE_URL) > 0 &&
+        strlen(SUPABASE_KEY) > 0) {
       syncWithSupabase();
     }
     vTaskDelay(pdMS_TO_TICKS(60)); // Yield to FreeRTOS scheduler
@@ -1028,16 +1320,24 @@ void loop() {
   if (millis() - lastDhtRead >= DHT_READ_INTERVAL_MS) {
     float t = dht.readTemperature();
     float h = dht.readHumidity();
-    if (!isnan(t)) currentTemp = t;
-    if (!isnan(h)) currentHum  = h;
+    if (!isnan(t))
+      currentTemp = t;
+    if (!isnan(h))
+      currentHum = h;
     lastDhtRead = millis();
   }
 
   // 3. Sample PIR Motion & Corridor LDRs
   pir1_active = (digitalRead(PIR1_PIN) == HIGH);
   pir2_active = (digitalRead(PIR2_PIN) == HIGH);
-  ldr1_value  = analogRead(LDR_CORRIDOR1_PIN);
-  ldr2_value  = analogRead(LDR_CORRIDOR2_PIN);
+  ldr1_value = analogRead(LDR_CORRIDOR1_PIN);
+  ldr2_value = analogRead(LDR_CORRIDOR2_PIN);
+
+  // 3b. Sample Classroom A101 AC Power Meter (ACS712 & ZMPT101B)
+  sampleA101PowerMeter();
+
+  // 3c. Integrate Real-Time Energy (Riemann sum: kWh = Watts * hours / 1000)
+  integrateRealEnergy();
 
   // 4. Classroom Occupancy State Machines (Debounced Hold Timer)
   unsigned long now = millis();
@@ -1066,24 +1366,24 @@ void loop() {
 
     // Classroom 1 Automation
     if (c1_occupied) {
-      state_c1_light   = true;
+      state_c1_light = true;
       state_c1_curtain = true;
-      state_c1_fan     = (currentTemp > currentTempThreshold);
+      state_c1_fan = (currentTemp > currentTempThreshold);
     } else {
-      state_c1_light   = false;
+      state_c1_light = false;
       state_c1_curtain = false;
-      state_c1_fan     = false;
+      state_c1_fan = false;
     }
 
     // Classroom 2 Automation
     if (c2_occupied) {
-      state_c2_light   = true;
+      state_c2_light = true;
       state_c2_curtain = true;
-      state_c2_fan     = (currentTemp > currentTempThreshold);
+      state_c2_fan = (currentTemp > currentTempThreshold);
     } else {
-      state_c2_light   = false;
+      state_c2_light = false;
       state_c2_curtain = false;
-      state_c2_fan     = false;
+      state_c2_fan = false;
     }
   }
 
@@ -1121,29 +1421,35 @@ void loop() {
 
     // Line 2: Climate Telemetry
     display.setCursor(0, 14);
-    display.printf("T:%.1fC  H:%.0f%%  %dW", currentTemp, currentHum, (int)getTotalLoadWatts());
+    display.printf("T:%.1fC  H:%.0f%%  %dW", currentTemp, currentHum,
+                   (int)getTotalLoadWatts());
 
-    // Line 3: Classroom 1 Status
+    // Line 3: Classroom 1 Status & Energy Meter
     display.setCursor(0, 26);
-    display.print(F("C1:"));
-    display.print(c1_occupied ? F("[OCC] ") : F("[VAC] "));
-    display.print(state_c1_light ? F("L1 ") : F("L0 "));
-    display.print(state_c1_fan   ? F("F1 ") : F("F0 "));
-    display.print(state_c1_curtain ? F("C1") : F("C0"));
+    if (c1_voltage >= 60.0f || c1_current >= 0.09f) {
+      display.printf("A101:%s %.0fV %.2fA", c1_occupied ? "OCC" : "VAC",
+                     c1_voltage, c1_current);
+    } else {
+      display.print(F("C1:"));
+      display.print(c1_occupied ? F("[OCC] ") : F("[VAC] "));
+      display.print(state_c1_light ? F("L1 ") : F("L0 "));
+      display.print(state_c1_fan ? F("F1 ") : F("F0 "));
+      display.print(state_c1_curtain ? F("C1") : F("C0"));
+    }
 
     // Line 4: Classroom 2 Status
     display.setCursor(0, 38);
     display.print(F("C2:"));
     display.print(c2_occupied ? F("[OCC] ") : F("[VAC] "));
     display.print(state_c2_light ? F("L1 ") : F("L0 "));
-    display.print(state_c2_fan   ? F("F1 ") : F("F0 "));
+    display.print(state_c2_fan ? F("F1 ") : F("F0 "));
     display.print(state_c2_curtain ? F("C1") : F("C0"));
 
     // Line 5: Corridors
     display.setCursor(0, 50);
     display.print(F("CR:"));
     display.print(state_corr1_light ? F("L1:ON ") : F("L1:-- "));
-    display.print(state_corr2_light ? F("L2:ON")  : F("L2:--"));
+    display.print(state_corr2_light ? F("L2:ON") : F("L2:--"));
 
     display.display();
     lastDisplayUpdate = now;

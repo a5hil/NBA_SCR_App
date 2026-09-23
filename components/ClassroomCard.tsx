@@ -56,7 +56,9 @@ export function ClassroomCard({ classroom }: ClassroomCardProps) {
         </View>
         <View style={styles.stat}>
           <Ionicons name="flash-outline" size={16} color={Colors.textMuted} />
-          <Text style={styles.statText}>{(classroom.currentLoad / 1000).toFixed(1)} kW</Text>
+          <Text style={styles.statText}>
+            {classroom.currentLoad < 1000 ? `${classroom.currentLoad.toFixed(0)} W` : `${(classroom.currentLoad / 1000).toFixed(2)} kW`}
+          </Text>
         </View>
       </View>
     </TouchableOpacity>

@@ -36,7 +36,8 @@ export function DeviceCard({ device, classroomId, onToggle }: DeviceCardProps) {
   const getStatusText = () => {
     if (isOffline) return 'Offline';
     if (isCurtain) return isOn ? 'Open (90°)' : 'Closed';
-    return isOn ? `On • ${device.powerUsage || 60}W` : 'Off';
+    const rating = device.ratedPower || (device.category === 'fan' ? 75 : device.category === 'light' ? 60 : 40);
+    return isOn ? `On • ${device.powerUsage || rating}W` : `Off • ${rating}W`;
   };
 
   return (

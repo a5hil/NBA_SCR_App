@@ -73,12 +73,28 @@ const chartStyles = StyleSheet.create({
 
 export default function EnergyScreen() {
   const { energyData, classrooms } = useApp();
-  const [period, setPeriod] = useState<Period>('daily');
+  const [period, setPeriod] = useState<Period>('hourly');
 
-  const data = energyData[period];
   const totalToday = classrooms.reduce((sum, c) => sum + c.energyToday, 0);
   const totalCost = classrooms.reduce((sum, c) => sum + c.estimatedCost, 0);
   const currentLoad = classrooms.reduce((sum, c) => sum + c.currentLoad, 0);
+
+  // Dynamically build daily & weekly metrics from real accumulated consumption
+  const todayIndex = (new Date().getDay() + 6) % 7; // 0=Mon, 6=Sun
+  const daysLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const dynamicDaily: EnergyReading[] = daysLabels.map((day, idx) => ({
+    time: day,
+    value: idx === todayIndex ? Number(totalToday.toFixed(3)) : (energyData.daily[idx]?.value || 0),
+  }));
+
+  const dynamicWeekly: EnergyReading[] = [
+    { time: 'Wk 1', value: 0 },
+    { time: 'Wk 2', value: 0 },
+    { time: 'Wk 3', value: 0 },
+    { time: 'Current', value: Number(totalToday.toFixed(3)) },
+  ];
+
+  const data = period === 'hourly' ? energyData.hourly : period === 'daily' ? dynamicDaily : dynamicWeekly;
 
   // Rankings by energy consumption
   const rankedClassrooms = [...classrooms].sort((a, b) => b.energyToday - a.energyToday);
@@ -92,17 +108,19 @@ export default function EnergyScreen() {
         <View style={styles.overviewRow}>
           <View style={[styles.overviewCard, { backgroundColor: Colors.primary }]}>
             <Ionicons name="flash" size={24} color="#000" />
-            <Text style={styles.overviewValue}>{totalToday.toFixed(1)}</Text>
+            <Text style={styles.overviewValue}>
+              {totalToday < 1 ? totalToday.toFixed(3) : totalToday.toFixed(2)}
+            </Text>
             <Text style={styles.overviewLabel}>kWh Today</Text>
           </View>
           <View style={styles.overviewCard}>
             <Ionicons name="cash-outline" size={24} color={Colors.success} />
-            <Text style={[styles.overviewValue, { color: Colors.text }]}>₹{totalCost.toFixed(0)}</Text>
+            <Text style={[styles.overviewValue, { color: Colors.text }]}>₹{totalCost.toFixed(1)}</Text>
             <Text style={[styles.overviewLabel, { color: Colors.textMuted }]}>Est. Cost</Text>
           </View>
           <View style={styles.overviewCard}>
             <Ionicons name="power" size={24} color={Colors.primary} />
-            <Text style={[styles.overviewValue, { color: Colors.text }]}>{(currentLoad / 1000).toFixed(1)}</Text>
+            <Text style={[styles.overviewValue, { color: Colors.text }]}>{(currentLoad / 1000).toFixed(2)}</Text>
             <Text style={[styles.overviewLabel, { color: Colors.textMuted }]}>kW Now</Text>
           </View>
         </View>
@@ -125,6 +143,7 @@ export default function EnergyScreen() {
               ))}
             </View>
           </View>
+
           <BarChart data={data} period={period} />
         </View>
 
@@ -148,13 +167,24 @@ export default function EnergyScreen() {
                   ]}>#{index + 1}</Text>
                 </View>
                 <View>
-                  <Text style={styles.rankName}>{cls.name}</Text>
-                  <Text style={styles.rankSub}>{cls.devices.filter(d => d.status === 'on').length} devices active</Text>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                    <Text style={styles.rankName}>{cls.name}</Text>
+                    {cls.hasPowerMeter && (
+                      <View style={{ backgroundColor: 'rgba(253, 168, 58, 0.15)', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 4 }}>
+                        <Text style={{ color: Colors.primary, fontSize: 9, fontWeight: '700' }}>RMS METER</Text>
+                      </View>
+                    )}
+                  </View>
+                  <Text style={styles.rankSub}>
+                    {cls.devices.filter(d => d.status === 'on').length} devices active • {cls.currentLoad.toFixed(0)}W
+                  </Text>
                 </View>
               </View>
               <View style={styles.rankRight}>
-                <Text style={styles.rankEnergy}>{cls.energyToday.toFixed(1)} kWh</Text>
-                <Text style={styles.rankCost}>₹{cls.estimatedCost.toFixed(0)}</Text>
+                <Text style={styles.rankEnergy}>
+                  {cls.energyToday < 1 ? cls.energyToday.toFixed(3) : cls.energyToday.toFixed(2)} kWh
+                </Text>
+                <Text style={styles.rankCost}>₹{cls.estimatedCost.toFixed(2)}</Text>
               </View>
             </View>
           ))}
