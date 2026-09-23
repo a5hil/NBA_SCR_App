@@ -147,6 +147,7 @@ export interface Campus {
 
 export interface ESP32Telemetry {
   ip: string;
+  ssid?: string;
   mode: 'auto' | 'manual';
   temperature: number;
   humidity: number;

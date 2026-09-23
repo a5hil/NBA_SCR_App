@@ -531,13 +531,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setEsp32Connected(true);
       const telemetry: ESP32Telemetry = {
         ip: data.controller?.ip || esp32Ip,
+        ssid: data.controller?.ssid,
         mode: (data.mode === 'auto' || data.mode === 'manual') ? data.mode : systemMode,
         temperature: Number(data.temperature) || 24,
         humidity: Number(data.humidity) || 50,
         totalLoadWatts: Number(data.total_load_watts) || 0,
         rssi: data.controller?.rssi,
         uptimeSec: data.controller?.uptime_sec,
-        firmware: data.controller?.firmware || '2.4.0',
+        firmware: data.controller?.firmware || '2.4.1',
         hourlyEnergy: Array.isArray(data.hourly_energy) ? data.hourly_energy.map(Number) : undefined,
         c1: {
           occupied: Boolean(data.classroom1?.occupied),

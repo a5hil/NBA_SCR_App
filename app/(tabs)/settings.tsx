@@ -44,7 +44,9 @@ export default function SettingsScreen() {
             <View style={styles.infoRow}>
               <Ionicons name="wifi" size={18} color={esp32Connected ? Colors.success : Colors.textMuted} />
               <Text style={styles.infoLabel}>Wi-Fi Network</Text>
-              <Text style={styles.infoValue}>{esp32Connected ? 'FTTH-6953 (Live)' : 'FTTH-6953'}</Text>
+              <Text style={styles.infoValue}>
+                {esp32Telemetry?.ssid ? `${esp32Telemetry.ssid} (Live)` : (esp32Connected ? 'Connected (Live)' : 'Standby / Offline')}
+              </Text>
             </View>
             <View style={styles.infoRow}>
               <Ionicons name="globe-outline" size={18} color={Colors.primary} />

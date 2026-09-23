@@ -534,6 +534,7 @@ String buildStatusJson(bool includeTelemetry = true) {
   if (includeTelemetry) {
     json += ",\"controller\":{";
     json += "\"firmware\":\"" + String(FIRMWARE_VERSION) + "\",";
+    json += "\"ssid\":\"" + String(WiFi.SSID()) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"uptime_sec\":" + String(millis() / 1000) + ",";
