@@ -40,7 +40,13 @@ export function NoticeModal({
 
   useEffect(() => {
     if (visible) {
-      setTargetId(defaultClassroomId);
+      // Disallow preselecting a corridor or hallway
+      const isCorridorTarget = Boolean(
+        defaultClassroomId &&
+        (defaultClassroomId.toLowerCase().includes('corridor') ||
+         defaultClassroomId.toLowerCase().includes('hallway'))
+      );
+      setTargetId(isCorridorTarget ? 'all' : defaultClassroomId);
       setTitle('');
       setMessage('');
       setDuration('24h');
@@ -48,10 +54,17 @@ export function NoticeModal({
     }
   }, [visible, defaultClassroomId]);
 
+  // Real classrooms only - explicitly exclude corridors, hallways, and non-classroom areas
   const targetOptions = [
-    { id: 'all', label: 'All Rooms (Broadcast)' },
+    { id: 'all', label: 'All Classrooms (Broadcast)' },
     ...classrooms
-      .filter((c) => c.id === 'cls-a101' || c.id === 'cls-a102')
+      .filter((c) => {
+        const id = c.id.toLowerCase();
+        const name = c.name.toLowerCase();
+        return !id.includes('corridor') && !id.includes('hallway') &&
+               !name.includes('corridor') && !name.includes('hallway') &&
+               c.capacity > 0;
+      })
       .map((c) => ({ id: c.id, label: c.name })),
   ];
 

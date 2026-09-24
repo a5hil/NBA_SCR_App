@@ -32,6 +32,16 @@ export function NoticeBoardCard({
   const [modalVisible, setModalVisible] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(0);
 
+  // Digital notice board is exclusively for classrooms, not corridors/hallways
+  const isCorridorArea = Boolean(
+    (filterClassroomId && (filterClassroomId.toLowerCase().includes('corridor') || filterClassroomId.toLowerCase().includes('hallway'))) ||
+    (classroomName && (classroomName.toLowerCase().includes('corridor') || classroomName.toLowerCase().includes('hallway')))
+  );
+
+  if (isCorridorArea) {
+    return null;
+  }
+
   // Filter notices relevant to this context
   const filteredNotices = notices.filter((n) => {
     if (!filterClassroomId || filterClassroomId === 'all') return true;

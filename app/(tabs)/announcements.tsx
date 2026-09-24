@@ -150,7 +150,7 @@ export default function AnnouncementsScreen() {
             <Text style={styles.listTitle}>
               Active Announcements ({filteredNotices.length})
             </Text>
-            <Text style={styles.listSubtitle}>Auto-rotates every 10s</Text>
+            <Text style={styles.listSubtitle}>Auto-rotates every 20s</Text>
           </View>
 
           {filteredNotices.length > 0 ? (

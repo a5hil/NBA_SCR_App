@@ -30,6 +30,13 @@ export default function ClassroomDetailScreen() {
     );
   }
 
+  const isClassroom = Boolean(
+    !classroom.id.toLowerCase().includes('corridor') &&
+    !classroom.name.toLowerCase().includes('corridor') &&
+    !classroom.name.toLowerCase().includes('hallway') &&
+    classroom.capacity > 0
+  );
+
   const isOffline = classroom.status === 'offline';
   const isOccupied = classroom.occupancy === 'occupied';
   const activeCount = classroom.devices.filter(d => d.status === 'on').length;
@@ -154,11 +161,13 @@ export default function ClassroomDetailScreen() {
           </View>
         )}
 
-        {/* Classroom Digital Notice Board (2nd OLED on Wire1 GPIO 13/15) */}
-        <NoticeBoardCard
-          filterClassroomId={classroom.id}
-          classroomName={classroom.name}
-        />
+        {/* Classroom Digital Notice Board (Exclusively enabled for actual classrooms) */}
+        {isClassroom && (
+          <NoticeBoardCard
+            filterClassroomId={classroom.id}
+            classroomName={classroom.name}
+          />
+        )}
 
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Devices ({activeCount}/{classroom.devices.length} On)</Text>
