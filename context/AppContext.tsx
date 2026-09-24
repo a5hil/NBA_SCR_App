@@ -277,10 +277,25 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [systemMode, setSystemModeState] = useState<'auto' | 'manual'>('manual');
   const isLanReachableRef = useRef<boolean>(false);
   const lastModeToggleRef = useRef<number>(0);
+  const lastManualIpSetRef = useRef<number>(0);
 
   const setEsp32Ip = useCallback(async (ip: string) => {
-    setEsp32IpState(ip);
-    await AsyncStorage.setItem(STORAGE_KEYS.ESP32_IP, ip).catch(console.error);
+    const trimmed = ip.trim();
+    if (!trimmed) return;
+    lastManualIpSetRef.current = Date.now();
+    setEsp32IpState(trimmed);
+    await AsyncStorage.setItem(STORAGE_KEYS.ESP32_IP, trimmed).catch(console.error);
+
+    if (isSupabaseConfigured) {
+      try {
+        await supabase
+          .from('controllers')
+          .update({ ip_address: trimmed, status: 'online', last_seen: new Date().toISOString() })
+          .eq('id', 'ctrl-esp32');
+      } catch (err) {
+        console.error('Failed to sync controller IP to Supabase', err);
+      }
+    }
   }, []);
 
   const loadFromSupabase = useCallback(async (): Promise<boolean> => {
@@ -305,7 +320,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const controllers = controllerRes.data as ControllerRow[];
     const esp32Ctrl = controllers.find(c => c.id === 'ctrl-esp32');
     if (esp32Ctrl) {
-      if (esp32Ctrl.ip_address) setEsp32IpState(esp32Ctrl.ip_address);
+      if (esp32Ctrl.ip_address && Date.now() - lastManualIpSetRef.current > 30000) {
+        setEsp32IpState(esp32Ctrl.ip_address);
+      }
       if (esp32Ctrl.status === 'online') setEsp32Connected(true);
     }
 
@@ -484,7 +501,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const newRecord = payload.new;
           if (newRecord && newRecord.id === 'ctrl-esp32') {
             if (newRecord.status === 'online') setEsp32Connected(true);
-            if (newRecord.ip_address) setEsp32IpState(newRecord.ip_address);
+            if (newRecord.ip_address && Date.now() - lastManualIpSetRef.current > 30000) {
+              setEsp32IpState(newRecord.ip_address);
+            }
           }
         }
       )
@@ -729,7 +748,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
           if (ctrlRes.data && ctrlRes.data.status === 'online') {
             setEsp32Connected(true);
-            if (ctrlRes.data.ip_address && ctrlRes.data.ip_address !== esp32Ip) {
+            if (
+              ctrlRes.data.ip_address &&
+              Date.now() - lastManualIpSetRef.current > 30000 &&
+              ctrlRes.data.ip_address !== esp32Ip
+            ) {
               setEsp32IpState(ctrlRes.data.ip_address);
             }
           }

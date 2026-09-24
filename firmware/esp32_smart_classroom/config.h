@@ -16,8 +16,8 @@
 // --- WI-FI & NETWORK SETTINGS ---
 // ==========================================
 // Change these to your Wi-Fi credentials or phone hotspot
-const char *const WIFI_SSID = "FTTH-6953";
-const char *const WIFI_PASSWORD = "antoko123";
+const char *const WIFI_SSID = "IDEA LAB";
+const char *const WIFI_PASSWORD = "idea#fisat";
 
 // Network Identifiers
 const char *const HOSTNAME =

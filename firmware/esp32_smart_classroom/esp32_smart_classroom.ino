@@ -115,6 +115,7 @@ bool cloud_prev_corr1_light = false;
 bool cloud_prev_corr2_light = false;
 bool cloud_prev_system_auto = false;
 volatile bool pendingModeCloudSync = false;
+volatile bool pendingIpCloudSync = true;
 unsigned long lastLocalModeChange = 0;
 
 // OLED Hardware flag
@@ -881,6 +882,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println(F("\n[OK] Wi-Fi Connected!"));
     Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    pendingIpCloudSync = true;
 
     // 6. Start mDNS Responder (http://esp32-classroom.local)
     if (MDNS.begin(HOSTNAME)) {
@@ -942,7 +944,45 @@ void syncWithSupabase() {
     return;
   unsigned long now = millis();
 
-  // 0. Sync System Mode to Cloud if changed locally (with retry on failure)
+  // 0A. Immediate Controller Heartbeat & Live IP sync on boot or Wi-Fi reconnect
+  if (pendingIpCloudSync) {
+    WiFiClientSecure ipClient;
+    ipClient.setInsecure();
+    ipClient.setTimeout(4000);
+    HTTPClient ipHttps;
+    ipHttps.setTimeout(4000);
+    String urlCtrl =
+        String(SUPABASE_URL) + "/rest/v1/controllers?id=eq.ctrl-esp32";
+    if (ipHttps.begin(ipClient, urlCtrl)) {
+      ipHttps.addHeader("apikey", SUPABASE_KEY);
+      ipHttps.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+      ipHttps.addHeader("Content-Type", "application/json");
+      ipHttps.addHeader("Prefer", "return=minimal");
+
+      int rssi = WiFi.RSSI();
+      String sig = (rssi > -60) ? "strong" : (rssi > -75) ? "medium" : "weak";
+      String body = "{\"status\":\"online\",\"signal_strength\":\"" + sig +
+                    "\",\"ip_address\":\"" + WiFi.localIP().toString() +
+                    "\",\"firmware_version\":\"" + String(FIRMWARE_VERSION) +
+                    "\"}";
+      int httpRes = ipHttps.sendRequest("PATCH", body);
+      if (httpRes >= 200 && httpRes < 300) {
+        pendingIpCloudSync = false;
+        Serial.printf("[SUPABASE] Live IP %s successfully pushed to Cloud (HTTP %d)\n",
+                      WiFi.localIP().toString().c_str(), httpRes);
+      } else {
+        Serial.printf(
+            "[SUPABASE WARN] Live IP sync failed (HTTP %d). Will retry.\n",
+            httpRes);
+      }
+      ipHttps.end();
+      ipClient.stop();
+    }
+    lastSupabasePoll = now;
+    return;
+  }
+
+  // 0B. Sync System Mode to Cloud if changed locally (with retry on failure)
   if (pendingModeCloudSync) {
     WiFiClientSecure mClient;
     mClient.setInsecure();
@@ -975,6 +1015,7 @@ void syncWithSupabase() {
     }
     lastSupabasePoll =
         now; // Delay next GET poll slightly so Supabase DB commit settles
+    return;
   }
 
   // 1. Fetch Remote Device Commands from Supabase (Every 1000ms)
@@ -1195,11 +1236,11 @@ void syncWithSupabase() {
       https.end();
       client.stop();
     }
+    return;
   }
 
-  // 2. Push Sensor & Occupancy Telemetry to Supabase (Alternate cycle -
-  // prevents TLS memory collision)
-  else if (now - lastSupabaseTelemetry >= SUPABASE_TELEMETRY_INTERVAL_MS) {
+  // 2. Push Sensor & Occupancy Telemetry to Supabase (Independent cycle)
+  if (now - lastSupabaseTelemetry >= SUPABASE_TELEMETRY_INTERVAL_MS) {
     lastSupabaseTelemetry = now;
     static int telemetryStep = 0;
 
@@ -1292,6 +1333,7 @@ void syncWithSupabase() {
     }
 
     telemetryStep = (telemetryStep + 1) % 4;
+    return;
   }
 }
 
