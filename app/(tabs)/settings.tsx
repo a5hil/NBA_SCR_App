@@ -1,5 +1,5 @@
-import React from 'react';
-import { View, Text, StyleSheet, ScrollView } from 'react-native';
+import React, { useState } from 'react';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Modal, TextInput, ActivityIndicator, Alert as RNAlert } from 'react-native';
 import { Colors } from '../../constants/colors';
 import { Layout } from '../../constants/layout';
 import { ScreenHeader } from '../../components/ScreenHeader';
@@ -8,9 +8,37 @@ import { Ionicons } from '@expo/vector-icons';
 import { Esp32LiveBar } from '../../components/Esp32LiveBar';
 
 export default function SettingsScreen() {
-  const { user, campus, classrooms, esp32Connected, esp32Telemetry } = useApp();
+  const { user, campus, classrooms, esp32Connected, esp32Telemetry, updateEsp32WiFi } = useApp();
+
+  const [wifiModalVisible, setWifiModalVisible] = useState(false);
+  const [inputSsid, setInputSsid] = useState('');
+  const [inputPassword, setInputPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [updatingWifi, setUpdatingWifi] = useState(false);
 
   const totalDevices = classrooms.reduce((sum, c) => sum + c.devices.length, 0);
+
+  const handleOpenWifiModal = () => {
+    setInputSsid(esp32Telemetry?.ssid || '');
+    setInputPassword('');
+    setShowPassword(false);
+    setWifiModalVisible(true);
+  };
+
+  const handleSaveWifi = async () => {
+    if (!inputSsid.trim()) {
+      RNAlert.alert('Required', 'Please enter a Wi-Fi network name (SSID).');
+      return;
+    }
+    setUpdatingWifi(true);
+    const res = await updateEsp32WiFi(inputSsid.trim(), inputPassword);
+    setUpdatingWifi(false);
+    if (res.success) {
+      setWifiModalVisible(false);
+    } else {
+      RNAlert.alert('Could Not Connect', res.message);
+    }
+  };
 
   return (
     <View style={styles.container}>
@@ -34,20 +62,32 @@ export default function SettingsScreen() {
 
         {/* Hardware & Network Specs */}
         <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Hardware Specification</Text>
+          <Text style={styles.sectionTitle}>System & Network</Text>
           <View style={styles.infoCard}>
             <View style={styles.infoRow}>
               <Ionicons name="hardware-chip" size={18} color={Colors.primary} />
-              <Text style={styles.infoLabel}>Microcontroller</Text>
-              <Text style={styles.infoValue}>ESP32-WROOM-32</Text>
+              <Text style={styles.infoLabel}>Automation Hub</Text>
+              <Text style={styles.infoValue}>Classroom Controller</Text>
             </View>
-            <View style={styles.infoRow}>
+
+            {/* Clickable Wi-Fi Network Row to Configure Wi-Fi */}
+            <TouchableOpacity 
+              style={styles.infoRow}
+              activeOpacity={0.7}
+              onPress={handleOpenWifiModal}
+            >
               <Ionicons name="wifi" size={18} color={esp32Connected ? Colors.success : Colors.textMuted} />
               <Text style={styles.infoLabel}>Wi-Fi Network</Text>
-              <Text style={styles.infoValue}>
-                {esp32Telemetry?.ssid ? `${esp32Telemetry.ssid} (Live)` : (esp32Connected ? 'Connected (Live)' : 'Standby / Offline')}
-              </Text>
-            </View>
+              <View style={styles.wifiValueContainer}>
+                <Text style={styles.infoValue}>
+                  {esp32Telemetry?.ssid ? `${esp32Telemetry.ssid} (Live)` : (esp32Connected ? 'Connected (Live)' : 'Standby / Offline')}
+                </Text>
+                <View style={styles.configureBadge}>
+                  <Text style={styles.configureBadgeText}>Change</Text>
+                </View>
+              </View>
+            </TouchableOpacity>
+
             <View style={styles.infoRow}>
               <Ionicons name="globe-outline" size={18} color={Colors.primary} />
               <Text style={styles.infoLabel}>mDNS URL</Text>
@@ -85,6 +125,99 @@ export default function SettingsScreen() {
 
         <View style={{ height: 100 }} />
       </ScrollView>
+
+      {/* Wi-Fi Configuration Modal */}
+      <Modal
+        visible={wifiModalVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => !updatingWifi && setWifiModalVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalContent}>
+            <View style={styles.modalHeader}>
+              <View style={styles.modalIconBox}>
+                <Ionicons name="wifi" size={24} color={Colors.primary} />
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.modalTitle}>Configure Controller Wi-Fi</Text>
+                <Text style={styles.modalSubtitle}>Update the network your classroom controller connects to</Text>
+              </View>
+            </View>
+
+            <View style={styles.inputGroup}>
+              <Text style={styles.inputLabel}>Wi-Fi Network Name (SSID)</Text>
+              <View style={styles.inputWrapper}>
+                <Ionicons name="wifi-outline" size={18} color={Colors.textMuted} style={styles.inputIcon} />
+                <TextInput
+                  style={styles.textInput}
+                  placeholder="e.g. Campus_WiFi or Hotspot"
+                  placeholderTextColor={Colors.textMuted}
+                  value={inputSsid}
+                  onChangeText={setInputSsid}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+              </View>
+            </View>
+
+            <View style={styles.inputGroup}>
+              <Text style={styles.inputLabel}>Wi-Fi Password</Text>
+              <View style={styles.inputWrapper}>
+                <Ionicons name="lock-closed-outline" size={18} color={Colors.textMuted} style={styles.inputIcon} />
+                <TextInput
+                  style={[styles.textInput, { paddingRight: 40 }]}
+                  placeholder="Leave empty if open network"
+                  placeholderTextColor={Colors.textMuted}
+                  value={inputPassword}
+                  onChangeText={setInputPassword}
+                  secureTextEntry={!showPassword}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                />
+                <TouchableOpacity 
+                  style={styles.eyeBtn}
+                  onPress={() => setShowPassword(!showPassword)}
+                >
+                  <Ionicons name={showPassword ? "eye-off-outline" : "eye-outline"} size={18} color={Colors.textMuted} />
+                </TouchableOpacity>
+              </View>
+            </View>
+
+            <View style={styles.noteBox}>
+              <Ionicons name="information-circle-outline" size={16} color={Colors.primary} />
+              <Text style={styles.noteText}>
+                The controller will save these credentials to permanent NVS flash memory and reboot into the new network.
+              </Text>
+            </View>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={styles.cancelBtn}
+                onPress={() => setWifiModalVisible(false)}
+                disabled={updatingWifi}
+              >
+                <Text style={styles.cancelBtnText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                style={[styles.saveBtn, updatingWifi && { opacity: 0.7 }]}
+                onPress={handleSaveWifi}
+                disabled={updatingWifi}
+              >
+                {updatingWifi ? (
+                  <ActivityIndicator size="small" color="#000" />
+                ) : (
+                  <>
+                    <Ionicons name="checkmark-circle-outline" size={18} color="#000" />
+                    <Text style={styles.saveBtnText}>Update & Reboot</Text>
+                  </>
+                )}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -172,5 +305,143 @@ const styles = StyleSheet.create({
     color: Colors.text,
     fontSize: 13,
     fontWeight: '600',
+  },
+  wifiValueContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  configureBadge: {
+    backgroundColor: 'rgba(253, 168, 58, 0.15)',
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: 'rgba(253, 168, 58, 0.3)',
+  },
+  configureBadgeText: {
+    color: Colors.primary,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  // Modal Styles
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0, 0, 0, 0.75)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 20,
+  },
+  modalContent: {
+    backgroundColor: Colors.card,
+    borderRadius: Layout.radius.xl,
+    padding: 24,
+    width: '100%',
+    maxWidth: 400,
+    borderWidth: 1,
+    borderColor: Colors.surfaceTranslucent,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+    marginBottom: 20,
+  },
+  modalIconBox: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: 'rgba(253, 168, 58, 0.12)',
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  modalTitle: {
+    color: Colors.text,
+    fontSize: 17,
+    fontWeight: '700',
+  },
+  modalSubtitle: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    marginTop: 2,
+  },
+  inputGroup: {
+    marginBottom: 16,
+  },
+  inputLabel: {
+    color: Colors.text,
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 6,
+  },
+  inputWrapper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1E1E1E',
+    borderRadius: Layout.radius.md,
+    borderWidth: 1,
+    borderColor: Colors.surfaceTranslucent,
+    paddingHorizontal: 12,
+  },
+  inputIcon: {
+    marginRight: 8,
+  },
+  textInput: {
+    flex: 1,
+    color: Colors.text,
+    fontSize: 14,
+    paddingVertical: 12,
+  },
+  eyeBtn: {
+    padding: 6,
+  },
+  noteBox: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    backgroundColor: 'rgba(253, 168, 58, 0.08)',
+    borderRadius: Layout.radius.md,
+    padding: 12,
+    gap: 10,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: 'rgba(253, 168, 58, 0.2)',
+  },
+  noteText: {
+    color: Colors.textMuted,
+    fontSize: 12,
+    lineHeight: 16,
+    flex: 1,
+  },
+  modalActions: {
+    flexDirection: 'row',
+    gap: 12,
+  },
+  cancelBtn: {
+    flex: 1,
+    paddingVertical: 13,
+    borderRadius: Layout.radius.md,
+    backgroundColor: 'rgba(255, 255, 255, 0.08)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  cancelBtnText: {
+    color: Colors.text,
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  saveBtn: {
+    flex: 2,
+    paddingVertical: 13,
+    borderRadius: Layout.radius.md,
+    backgroundColor: Colors.primary,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+  },
+  saveBtnText: {
+    color: '#000',
+    fontSize: 14,
+    fontWeight: '700',
   },
 });

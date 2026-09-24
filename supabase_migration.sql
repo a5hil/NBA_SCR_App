@@ -51,11 +51,25 @@ ALTER TABLE public.alerts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.activity ENABLE ROW LEVEL SECURITY;
 
+-- 7. Announcements / Digital Notice Board Table
+CREATE TABLE IF NOT EXISTS public.announcements (
+  id TEXT PRIMARY KEY,
+  classroom_id TEXT NOT NULL, -- 'all' for broadcast, or 'cls-a101', 'cls-a102', etc.
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  duration TEXT DEFAULT '24h',
+  expires_at TIMESTAMP WITH TIME ZONE,
+  is_active BOOLEAN DEFAULT true,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+ALTER TABLE public.announcements ENABLE ROW LEVEL SECURITY;
+
 DO $$
 DECLARE t TEXT;
 BEGIN
-  FOREACH t IN ARRAY ARRAY['campuses','classrooms','controllers','devices','alerts','notifications','activity'] LOOP
+  FOREACH t IN ARRAY ARRAY['campuses','classrooms','controllers','devices','alerts','notifications','activity','announcements'] LOOP
     EXECUTE format('DROP POLICY IF EXISTS "allow_all" ON public.%I', t);
     EXECUTE format('CREATE POLICY "allow_all" ON public.%I FOR ALL USING (true) WITH CHECK (true)', t);
   END LOOP;
-END $$;
+END $$;

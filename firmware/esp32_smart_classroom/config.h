@@ -15,9 +15,19 @@
 // ==========================================
 // --- WI-FI & NETWORK SETTINGS ---
 // ==========================================
-// Change these to your Wi-Fi credentials or phone hotspot
-const char *const WIFI_SSID = "IDEA LAB";
-const char *const WIFI_PASSWORD = "idea#fisat";
+// Default fallback credentials if no Wi-Fi is configured in NVS Flash
+const char *const DEFAULT_WIFI_SSID = "IDEA LAB";
+const char *const DEFAULT_WIFI_PASSWORD = "idea#fisat";
+
+// Backward-compatible aliases
+#define WIFI_SSID DEFAULT_WIFI_SSID
+#define WIFI_PASSWORD DEFAULT_WIFI_PASSWORD
+
+// Standalone Setup Hotspot
+// Automatically starts if connection to saved Wi-Fi fails or times out
+const char *const SETUP_AP_SSID = "NBA-Smart-Classroom";
+const char *const SETUP_AP_PASSWORD = ""; // Open hotspot for effortless connection
+const int WIFI_CONNECT_TIMEOUT_SEC = 15;  // Seconds before starting setup hotspot
 
 // Network Identifiers
 const char *const HOSTNAME =
@@ -57,13 +67,20 @@ const unsigned long SUPABASE_TELEMETRY_INTERVAL_MS =
 // --- GPIO PIN DEFINITIONS ---
 // ==========================================
 
-// --- I2C OLED Display (SSD1306 128x64) ---
+// --- I2C OLED Display 1: System & Energy Telemetry (SSD1306 128x64 on Wire) ---
 #define OLED_SDA_PIN 21
 #define OLED_SCL_PIN 22
 #define OLED_I2C_ADDR 0x3C
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 #define OLED_RESET_PIN -1
+
+// --- I2C OLED Display 2: Classroom Digital Notice Board (SSD1306 128x64 on Wire1) ---
+// Uses secondary hardware I2C bus (Wire1) so NO soldering or jumper cutting is needed!
+#define NOTICE_OLED_SDA_PIN 13 // Secondary I2C Data
+#define NOTICE_OLED_SCL_PIN 15 // Secondary I2C Clock
+#define NOTICE_OLED_I2C_ADDR 0x3C
+#define NOTICE_ROTATION_MS 20000 // Rotate through notices every 20 seconds
 
 // --- Shared Environment Sensors ---
 #define DHTPIN 4      // DHT11 or DHT22 Temperature & Humidity Sensor

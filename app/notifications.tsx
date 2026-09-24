@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, ScrollView, TouchableOpacity } from 'react-nati
 import { Colors } from '../constants/colors';
 import { Layout } from '../constants/layout';
 import { ScreenHeader } from '../components/ScreenHeader';
+import { FloatingBottomNav } from '../components/FloatingBottomNav';
 import { useApp } from '../context/AppContext';
 import { Ionicons } from '@expo/vector-icons';
 import { NotificationItem } from '../types';
@@ -115,8 +116,10 @@ export default function NotificationsScreen() {
             <Text style={styles.emptySubtitle}>You're all caught up!</Text>
           </View>
         )}
-        <View style={{ height: 40 }} />
+        <View style={{ height: 100 }} />
       </ScrollView>
+
+      <FloatingBottomNav />
     </View>
   );
 }

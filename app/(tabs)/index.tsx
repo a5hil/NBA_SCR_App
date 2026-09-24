@@ -7,6 +7,7 @@ import { EnergyOverviewCard } from '../../components/EnergyOverviewCard';
 import { QuickControls } from '../../components/QuickControls';
 import { Esp32LiveBar } from '../../components/Esp32LiveBar';
 import { ClassroomCard } from '../../components/ClassroomCard';
+import { NoticeBoardCard } from '../../components/NoticeBoardCard';
 import { useApp } from '../../context/AppContext';
 import { useRouter } from 'expo-router';
 
@@ -25,6 +26,11 @@ export default function HomeScreen() {
         <EnergyOverviewCard />
         
         <Esp32LiveBar />
+
+        {/* Campus Digital Notice Board (Broadcast to all classrooms) */}
+        <View style={styles.noticeSection}>
+          <NoticeBoardCard isHomeScreen={true} />
+        </View>
         
         <QuickControls />
 
@@ -54,6 +60,9 @@ const styles = StyleSheet.create({
   },
   scrollContent: {
     paddingTop: 16,
+  },
+  noticeSection: {
+    paddingHorizontal: Layout.spacing.md,
   },
   section: {
     paddingHorizontal: Layout.spacing.md,

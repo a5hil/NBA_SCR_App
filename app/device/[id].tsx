@@ -4,6 +4,7 @@ import { useLocalSearchParams, useRouter } from 'expo-router';
 import { Colors } from '../../constants/colors';
 import { Layout } from '../../constants/layout';
 import { ScreenHeader } from '../../components/ScreenHeader';
+import { FloatingBottomNav } from '../../components/FloatingBottomNav';
 import { useApp } from '../../context/AppContext';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -99,22 +100,22 @@ export default function DeviceDetailScreen() {
     }
   };
 
-  const getHardwarePin = () => {
+  const getCircuitChannel = () => {
     if (classroom.id.includes('101') || classroom.id === 'cls-a101') {
-      if (device.category === 'light') return 'GPIO 25 (Relay 1)';
-      if (device.category === 'fan') return 'GPIO 27 (Relay 2)';
-      if (device.category === 'curtain') return 'GPIO 18 (Servo 1)';
+      if (device.category === 'light') return 'Main Lighting Line 1';
+      if (device.category === 'fan') return 'Ceiling Fan Circuit 1';
+      if (device.category === 'curtain') return 'Motorized Blind Actuator 1';
     }
     if (classroom.id.includes('102') || classroom.id === 'cls-a102') {
-      if (device.category === 'light') return 'GPIO 26 (Relay 3)';
-      if (device.category === 'fan') return 'GPIO 14 (Relay 4)';
-      if (device.category === 'curtain') return 'GPIO 19 (Servo 2)';
+      if (device.category === 'light') return 'Main Lighting Line 2';
+      if (device.category === 'fan') return 'Ceiling Fan Circuit 2';
+      if (device.category === 'curtain') return 'Motorized Blind Actuator 2';
     }
     if (classroom.id.includes('corr') || classroom.id === 'cls-corridor') {
-      if (device.id.includes('2')) return 'GPIO 17 (Relay 6)';
-      return 'GPIO 16 (Relay 5)';
+      if (device.id.includes('2')) return 'Corridor Line 2';
+      return 'Corridor Line 1';
     }
-    return `Relay Channel #${device.relayChannel}`;
+    return `Smart Line #${device.relayChannel}`;
   };
 
   const getStatusLabel = () => {
@@ -281,8 +282,8 @@ export default function DeviceDetailScreen() {
 
         {/* Quick Action Control Buttons */}
         <View style={styles.actionCard}>
-          <Text style={styles.actionTitle}>Physical Action</Text>
-          <Text style={styles.actionSubtitle}>Sends immediate command to ESP32 controller</Text>
+          <Text style={styles.actionTitle}>Manual Control</Text>
+          <Text style={styles.actionSubtitle}>Apply immediate state change to this appliance</Text>
           <View style={styles.buttonRow}>
             <TouchableOpacity
               style={[styles.actionButton, isOn && styles.actionButtonActive]}
@@ -312,29 +313,25 @@ export default function DeviceDetailScreen() {
           </View>
         </View>
 
-        {/* Hardware & Controller Specs */}
+        {/* Appliance & Control Specs */}
         <View style={styles.infoCard}>
-          <Text style={styles.infoTitle}>ESP32 Hardware Details</Text>
+          <Text style={styles.infoTitle}>Appliance Details</Text>
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Category</Text>
+            <Text style={styles.infoLabel}>Appliance Type</Text>
             <Text style={styles.infoValue}>{isCurtain ? 'Motorized Curtain' : isFan ? 'Ceiling Fan' : 'Room Lighting'}</Text>
           </View>
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Assigned Pin</Text>
-            <Text style={styles.infoValue}>{getHardwarePin()}</Text>
+            <Text style={styles.infoLabel}>Control Line</Text>
+            <Text style={styles.infoValue}>{getCircuitChannel()}</Text>
           </View>
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Microcontroller</Text>
-            <Text style={styles.infoValue}>ESP32-WROOM-32</Text>
+            <Text style={styles.infoLabel}>Automation Hub</Text>
+            <Text style={styles.infoValue}>Classroom Controller</Text>
           </View>
           <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Controller IP</Text>
-            <Text style={styles.infoValue}>{esp32Ip}</Text>
-          </View>
-          <View style={styles.infoRow}>
-            <Text style={styles.infoLabel}>Hardware Link</Text>
+            <Text style={styles.infoLabel}>Network Link</Text>
             <Text style={[styles.infoValue, { color: esp32Connected ? Colors.success : Colors.warning }]}>
-              {esp32Connected ? 'Connected (Live)' : 'Standby / Simulated'}
+              {esp32Connected ? 'Online (Synced)' : 'Offline / Standby'}
             </Text>
           </View>
           <View style={[styles.infoRow, { borderBottomWidth: 0 }]}>
@@ -343,8 +340,10 @@ export default function DeviceDetailScreen() {
           </View>
         </View>
 
-        <View style={{ height: 40 }} />
+        <View style={{ height: 100 }} />
       </ScrollView>
+
+      <FloatingBottomNav activeTab="classrooms" />
     </View>
   );
 }

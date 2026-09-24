@@ -4,7 +4,7 @@ import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import {
   User, Campus, Classroom, Device, Controller, Alert, NotificationItem, ActivityItem, EnergyReading,
   DeviceCategory, DeviceStatus, DeviceCapability, ClassroomStatus, OccupancyStatus, AlertSeverity, NotificationType,
-  ESP32Telemetry,
+  ESP32Telemetry, NoticeItem, NoticeDuration,
 } from '../types';
 import {
   mockUser, mockCampus, mockClassrooms, mockAlerts, mockNotifications, mockEnergyData,
@@ -52,6 +52,10 @@ interface AppContextType {
   setSystemMode: (mode: 'auto' | 'manual') => Promise<void>;
   syncWithEsp32: () => Promise<boolean>;
   toggleEsp32Mode: () => Promise<void>;
+  updateEsp32WiFi: (ssid: string, password: string) => Promise<{ success: boolean; message: string }>;
+  notices: NoticeItem[];
+  addNotice: (notice: Omit<NoticeItem, 'id' | 'createdAt' | 'isActive'>) => Promise<boolean>;
+  deleteNotice: (id: string) => Promise<boolean>;
 }
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -69,6 +73,7 @@ const STORAGE_KEYS = {
   QUICK_CONTROLS: '@quickControls',
   ESP32_IP: '@esp32_ip',
   SYSTEM_MODE: '@system_mode',
+  NOTICES: '@notices',
 };
 
 const SETTING_KEYS = ['brightness', 'speed', 'temperature', 'mode', 'fanSpeed', 'volume', 'source', 'direction', 'colorTemp'] as const;
@@ -262,6 +267,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [classrooms, setClassrooms] = useState<Classroom[]>(mockClassrooms);
   const [alerts, setAlerts] = useState<Alert[]>(mockAlerts);
   const [notifications, setNotifications] = useState<NotificationItem[]>(mockNotifications);
+  const [notices, setNotices] = useState<NoticeItem[]>([]);
   const [energyData, setEnergyData] = useState(mockEnergyData);
   const [quickControls, setQuickControls] = useState<QuickControls>({
     allLights: false, allFans: false, allCurtains: false,
@@ -341,6 +347,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setAlerts((alertRes.data as AlertRow[]).map(mapAlert));
     setNotifications((notifRes.data as NotificationRow[]).map(mapNotification));
     setQuickControls({ allLights: false, allFans: false, allCurtains: false });
+
+    try {
+      const annRes = await supabase
+        .from('announcements')
+        .select('*')
+        .eq('is_active', true)
+        .order('created_at', { ascending: false });
+      if (annRes.data) {
+        const now = Date.now();
+        const validNotices: NoticeItem[] = (annRes.data as any[]).map(a => ({
+          id: a.id,
+          classroomId: a.classroom_id,
+          classroomName: a.classroom_id === 'all'
+            ? 'All Classrooms (Broadcast)'
+            : (validRooms.find(r => r.id === a.classroom_id)?.name || a.classroom_id),
+          title: a.title,
+          message: a.message,
+          duration: (a.duration || '24h') as NoticeDuration,
+          createdAt: a.created_at || new Date().toISOString(),
+          expiresAt: a.expires_at || null,
+          isActive: a.is_active !== false,
+        })).filter(n => !n.expiresAt || new Date(n.expiresAt).getTime() > now);
+        setNotices(validNotices);
+      }
+    } catch (e) {
+      console.warn('Could not load announcements from Supabase:', e);
+    }
+
     return true;
   }, []);
 
@@ -362,6 +396,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const storedQuickControls = await AsyncStorage.getItem(STORAGE_KEYS.QUICK_CONTROLS);
           const storedEsp32Ip = await AsyncStorage.getItem(STORAGE_KEYS.ESP32_IP);
           const storedSystemMode = await AsyncStorage.getItem(STORAGE_KEYS.SYSTEM_MODE);
+          const storedNotices = await AsyncStorage.getItem(STORAGE_KEYS.NOTICES);
+
+          if (storedNotices) {
+            try {
+              const parsed = JSON.parse(storedNotices);
+              const now = Date.now();
+              setNotices(parsed.filter((n: NoticeItem) => !n.expiresAt || new Date(n.expiresAt).getTime() > now));
+            } catch {}
+          }
 
           if (storedClassrooms) {
             try {
@@ -418,6 +461,11 @@ export function AppProvider({ children }: { children: ReactNode }) {
     if (!isReady) return;
     AsyncStorage.setItem(STORAGE_KEYS.SYSTEM_MODE, systemMode).catch(console.error);
   }, [systemMode, isReady]);
+
+  useEffect(() => {
+    if (!isReady) return;
+    AsyncStorage.setItem(STORAGE_KEYS.NOTICES, JSON.stringify(notices)).catch(console.error);
+  }, [notices, isReady]);
 
   // Listen for Live Updates from Supabase (Devices, Sensor Telemetry & Controller Heartbeats)!
   useEffect(() => {
@@ -504,6 +552,35 @@ export function AppProvider({ children }: { children: ReactNode }) {
             if (newRecord.ip_address && Date.now() - lastManualIpSetRef.current > 30000) {
               setEsp32IpState(newRecord.ip_address);
             }
+          }
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'announcements' },
+        async () => {
+          try {
+            const { data } = await supabase
+              .from('announcements')
+              .select('*')
+              .eq('is_active', true)
+              .order('created_at', { ascending: false });
+            if (data) {
+              const now = Date.now();
+              setNotices(data.map((a: any) => ({
+                id: a.id,
+                classroomId: a.classroom_id,
+                classroomName: a.classroom_id === 'all' ? 'All Classrooms (Broadcast)' : a.classroom_id,
+                title: a.title,
+                message: a.message,
+                duration: (a.duration || '24h') as NoticeDuration,
+                createdAt: a.created_at || new Date().toISOString(),
+                expiresAt: a.expires_at || null,
+                isActive: a.is_active !== false,
+              })).filter((n: NoticeItem) => !n.expiresAt || new Date(n.expiresAt).getTime() > now));
+            }
+          } catch (e) {
+            console.error('Failed to update announcements from Realtime:', e);
           }
         }
       )
@@ -1221,6 +1298,146 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
+  const updateEsp32WiFi = useCallback(async (ssid: string, password: string): Promise<{ success: boolean; message: string }> => {
+    const trimmedSsid = ssid.trim();
+    if (!trimmedSsid) {
+      return { success: false, message: 'SSID cannot be empty' };
+    }
+
+    if (esp32Ip) {
+      try {
+        const baseUrl = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 6000);
+        const res = await fetch(`${baseUrl}/api/wifi`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ssid: trimmedSsid, password }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (res.ok) {
+          showToast(`Wi-Fi saved! Controller rebooting into "${trimmedSsid}"`, 'success');
+          return { success: true, message: `Wi-Fi saved! Controller is rebooting into "${trimmedSsid}".` };
+        }
+      } catch (err) {
+        console.warn('LAN Wi-Fi update failed:', err);
+      }
+    }
+
+    return {
+      success: false,
+      message: 'Could not reach ESP32 directly. Ensure your phone is connected to the same Wi-Fi or the "NBA-Smart-Classroom" setup hotspot.',
+    };
+  }, [esp32Ip, showToast]);
+
+  const addNotice = useCallback(async (
+    item: Omit<NoticeItem, 'id' | 'createdAt' | 'isActive'>
+  ): Promise<boolean> => {
+    const now = Date.now();
+    let expiresAt: string | null = null;
+    if (item.duration === '1h') {
+      expiresAt = new Date(now + 3600000).toISOString();
+    } else if (item.duration === '24h') {
+      expiresAt = new Date(now + 86400000).toISOString();
+    } else {
+      expiresAt = null; // 'never'
+    }
+
+    const newNotice: NoticeItem = {
+      id: `notif-${now}`,
+      classroomId: item.classroomId,
+      classroomName: item.classroomName,
+      title: item.title.trim(),
+      message: item.message.trim(),
+      duration: item.duration,
+      createdAt: new Date(now).toISOString(),
+      expiresAt,
+      isActive: true,
+    };
+
+    // Optimistic local state update
+    setNotices(prev => [newNotice, ...prev]);
+    showToast(
+      item.classroomId === 'all'
+        ? 'Broadcast notice published to all classrooms!'
+        : 'Notice posted to classroom OLED board!',
+      'success'
+    );
+
+    // 1. Direct LAN dispatch to ESP32 for immediate OLED update
+    if (esp32Ip) {
+      try {
+        const baseUrl = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        fetch(`${baseUrl}/api/notice`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            id: newNotice.id,
+            classroom_id: newNotice.classroomId,
+            title: newNotice.title,
+            message: newNotice.message,
+            duration: newNotice.duration,
+          }),
+          signal: controller.signal,
+        }).then(() => clearTimeout(timeoutId)).catch(() => clearTimeout(timeoutId));
+      } catch {}
+    }
+
+    // 2. Cloud persistence in Supabase
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('announcements').insert([{
+          id: newNotice.id,
+          classroom_id: newNotice.classroomId,
+          title: newNotice.title,
+          message: newNotice.message,
+          duration: newNotice.duration,
+          expires_at: newNotice.expiresAt,
+          is_active: true,
+          created_at: newNotice.createdAt,
+        }]);
+      } catch (err) {
+        console.error('Failed to sync notice to Supabase:', err);
+      }
+    }
+
+    return true;
+  }, [esp32Ip, showToast]);
+
+  const deleteNotice = useCallback(async (id: string): Promise<boolean> => {
+    setNotices(prev => prev.filter(n => n.id !== id));
+    showToast('Notice removed from board', 'info');
+
+    // 1. Direct LAN dispatch to ESP32
+    if (esp32Ip) {
+      try {
+        const baseUrl = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        fetch(`${baseUrl}/api/notice/delete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id }),
+          signal: controller.signal,
+        }).then(() => clearTimeout(timeoutId)).catch(() => clearTimeout(timeoutId));
+      } catch {}
+    }
+
+    // 2. Delete / deactivate in Supabase
+    if (isSupabaseConfigured) {
+      try {
+        await supabase.from('announcements').delete().eq('id', id);
+      } catch (err) {
+        console.error('Failed to delete notice from Supabase:', err);
+      }
+    }
+
+    return true;
+  }, [esp32Ip, showToast]);
+
   if (!isReady) return null;
 
   return (
@@ -1235,6 +1452,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
       esp32Ip, setEsp32Ip, esp32Connected, esp32Telemetry,
       systemMode, setSystemMode,
       syncWithEsp32, toggleEsp32Mode,
+      updateEsp32WiFi,
+      notices, addNotice, deleteNotice,
     }}>
       {children}
     </AppContext.Provider>

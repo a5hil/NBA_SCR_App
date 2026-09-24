@@ -60,7 +60,7 @@ export function Esp32LiveBar() {
             <Ionicons name="hardware-chip" size={18} color={esp32Connected ? Colors.success : Colors.textMuted} />
           </View>
           <View>
-            <Text style={styles.title}>ESP32 Dual-Classroom Controller</Text>
+            <Text style={styles.title}>Classroom Automation Hub</Text>
             <Text style={styles.subtitle}>
               IP: {esp32Ip || 'Auto-Detected'} • Cloud Synced
             </Text>
@@ -159,9 +159,9 @@ export function Esp32LiveBar() {
       >
         <View style={styles.modalBackdrop}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>ESP32 Controller IP</Text>
+            <Text style={styles.modalTitle}>Controller Hub IP</Text>
             <Text style={styles.modalSubtitle}>
-              Enter the IP address of your ESP32 board (displayed on the OLED screen or router DHCP):
+              Enter the network IP address of your classroom automation hub (displayed on device startup screen or router):
             </Text>
 
             <TextInput

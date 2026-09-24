@@ -3,6 +3,7 @@ import { View, StyleSheet, TouchableOpacity, useWindowDimensions, Platform } fro
 import { BlurView } from 'expo-blur';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
+import { useRouter, usePathname } from 'expo-router';
 import { Colors } from '../constants/colors';
 import { Layout } from '../constants/layout';
 
@@ -13,80 +14,143 @@ type NavRoute = {
 };
 
 type FloatingBottomNavProps = {
-  state: {
+  state?: {
     index: number;
     routes: NavRoute[];
   };
-  descriptors: Record<string, { options: { tabBarAccessibilityLabel?: string } }>;
-  navigation: {
+  descriptors?: Record<string, { options: { tabBarAccessibilityLabel?: string } }>;
+  navigation?: {
     emit: (event: { type: string; target: string; canPreventDefault: boolean }) => { defaultPrevented: boolean };
     navigate: (name: string, params?: object) => void;
   };
+  activeTab?: 'index' | 'classrooms' | 'announcements' | 'energy' | 'settings';
 };
 
 const iconMap: Record<string, { active: keyof typeof Ionicons.glyphMap; inactive: keyof typeof Ionicons.glyphMap }> = {
   index: { active: 'home', inactive: 'home-outline' },
   classrooms: { active: 'business', inactive: 'business-outline' },
+  announcements: { active: 'megaphone', inactive: 'megaphone-outline' },
   energy: { active: 'flash', inactive: 'flash-outline' },
   settings: { active: 'settings', inactive: 'settings-outline' },
 };
 
-export function FloatingBottomNav({ state, descriptors, navigation }: FloatingBottomNavProps) {
+const STANDALONE_TABS: { key: string; name: 'index' | 'classrooms' | 'announcements' | 'energy' | 'settings'; label: string; href: string }[] = [
+  { key: 'index', name: 'index', label: 'Home', href: '/(tabs)' },
+  { key: 'classrooms', name: 'classrooms', label: 'Classrooms', href: '/(tabs)/classrooms' },
+  { key: 'announcements', name: 'announcements', label: 'Notices', href: '/(tabs)/announcements' },
+  { key: 'energy', name: 'energy', label: 'Energy', href: '/(tabs)/energy' },
+  { key: 'settings', name: 'settings', label: 'Settings', href: '/(tabs)/settings' },
+];
+
+export function FloatingBottomNav({ state, descriptors, navigation, activeTab }: FloatingBottomNavProps) {
   const { width } = useWindowDimensions();
   const insets = useSafeAreaInsets();
+  const router = useRouter();
+  const pathname = usePathname();
 
-  const navWidth = Math.min(Layout.nav.width, width - 32);
+  const isTabsMode = !!(state && descriptors && navigation);
+  const routeCount = isTabsMode ? state.routes.length : STANDALONE_TABS.length;
+  const isFiveTabs = routeCount >= 5;
+  const navWidth = Math.min(isFiveTabs ? 356 : Layout.nav.width, width - 24);
   const bottomPadding = Math.max(insets.bottom, 16);
+  const btnSize = isFiveTabs ? 52 : Layout.nav.circleSize;
+
+  const getStandaloneActiveTab = () => {
+    if (activeTab) return activeTab;
+    if (pathname.includes('classroom')) return 'classrooms';
+    if (pathname.includes('announcement')) return 'announcements';
+    if (pathname.includes('energy')) return 'energy';
+    if (pathname.includes('setting')) return 'settings';
+    if (pathname.includes('device')) return 'classrooms';
+    return null;
+  };
+  const standaloneActive = getStandaloneActiveTab();
 
   return (
     <View style={[styles.container, { bottom: bottomPadding, left: (width - navWidth) / 2 }]}>
       <BlurView
         intensity={Platform.OS === 'ios' ? 80 : 100}
         tint="dark"
-        style={[styles.blurContainer, { width: navWidth }]}
+        style={[
+          styles.blurContainer,
+          { width: navWidth, height: isFiveTabs ? 72 : Layout.nav.height, borderRadius: isFiveTabs ? 36 : 41 },
+        ]}
         blurMethod="none"
       >
         <View style={styles.navContent}>
-          {state.routes.map((route, index) => {
-            const { options } = descriptors[route.key];
-            const isFocused = state.index === index;
+          {isTabsMode
+            ? state!.routes.map((route, index) => {
+                const { options } = descriptors![route.key];
+                const isFocused = state!.index === index;
 
-            const onPress = () => {
-              const event = navigation.emit({
-                type: 'tabPress',
-                target: route.key,
-                canPreventDefault: true,
-              });
+                const onPress = () => {
+                  const event = navigation!.emit({
+                    type: 'tabPress',
+                    target: route.key,
+                    canPreventDefault: true,
+                  });
 
-              if (!isFocused && !event.defaultPrevented) {
-                navigation.navigate(route.name, route.params);
-              }
-            };
+                  if (!isFocused && !event.defaultPrevented) {
+                    navigation!.navigate(route.name, route.params);
+                  }
+                };
 
-            const icons = iconMap[route.name] || iconMap.index;
-            const iconName = isFocused ? icons.active : icons.inactive;
+                const icons = iconMap[route.name] || iconMap.index;
+                const iconName = isFocused ? icons.active : icons.inactive;
 
-            return (
-              <TouchableOpacity
-                key={route.key}
-                accessibilityRole="button"
-                accessibilityState={isFocused ? { selected: true } : {}}
-                accessibilityLabel={options.tabBarAccessibilityLabel || route.name}
-                onPress={onPress}
-                style={[
-                  styles.tabButton,
-                  isFocused && styles.tabButtonActive,
-                ]}
-                activeOpacity={0.7}
-              >
-                <Ionicons
-                  name={iconName}
-                  size={24}
-                  color={Colors.text}
-                />
-              </TouchableOpacity>
-            );
-          })}
+                return (
+                  <TouchableOpacity
+                    key={route.key}
+                    accessibilityRole="button"
+                    accessibilityState={isFocused ? { selected: true } : {}}
+                    accessibilityLabel={options.tabBarAccessibilityLabel || route.name}
+                    onPress={onPress}
+                    style={[
+                      styles.tabButton,
+                      { width: btnSize, height: btnSize, borderRadius: btnSize / 2 },
+                      isFocused && styles.tabButtonActive,
+                    ]}
+                    activeOpacity={0.7}
+                  >
+                    <Ionicons
+                      name={iconName}
+                      size={isFiveTabs ? 22 : 24}
+                      color={Colors.text}
+                    />
+                  </TouchableOpacity>
+                );
+              })
+            : STANDALONE_TABS.map((tab) => {
+                const isFocused = standaloneActive === tab.name;
+                const icons = iconMap[tab.name] || iconMap.index;
+                const iconName = isFocused ? icons.active : icons.inactive;
+
+                const onPress = () => {
+                  router.navigate(tab.href as any);
+                };
+
+                return (
+                  <TouchableOpacity
+                    key={tab.key}
+                    accessibilityRole="button"
+                    accessibilityState={isFocused ? { selected: true } : {}}
+                    accessibilityLabel={tab.label}
+                    onPress={onPress}
+                    style={[
+                      styles.tabButton,
+                      { width: btnSize, height: btnSize, borderRadius: btnSize / 2 },
+                      isFocused && styles.tabButtonActive,
+                    ]}
+                    activeOpacity={0.7}
+                  >
+                    <Ionicons
+                      name={iconName}
+                      size={isFiveTabs ? 22 : 24}
+                      color={Colors.text}
+                    />
+                  </TouchableOpacity>
+                );
+              })}
         </View>
       </BlurView>
     </View>

@@ -39,6 +39,33 @@
 // ==========================================
 WebServer server(WEB_SERVER_PORT);
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET_PIN);
+
+// --- Secondary Hardware I2C Bus (Wire1) for Classroom Notice Board OLED ---
+// Uses GPIO 13 (SDA) and GPIO 15 (SCL) - No soldering or SMD cutting needed!
+TwoWire I2C_Notice = TwoWire(1);
+Adafruit_SSD1306 displayNotice(SCREEN_WIDTH, SCREEN_HEIGHT, &I2C_Notice, OLED_RESET_PIN);
+bool noticeOledFound = false;
+
+// --- Classroom Digital Notice Board State & Carousel ---
+struct NoticeItemFirmware {
+  String id;
+  String classroomId; // "all", "cls-a101", "cls-a102"
+  String title;
+  String message;
+  String duration;    // "1h", "24h", "never"
+  unsigned long createdAtMs;
+  unsigned long durationMs; // 3600000 for 1h, 86400000 for 24h, 0 for never
+  bool active;
+};
+
+#define MAX_FIRMWARE_NOTICES 10
+NoticeItemFirmware notices[MAX_FIRMWARE_NOTICES];
+int noticeCount = 0;
+int currentNoticeDisplayIndex = 0;
+unsigned long lastNoticeRotationMs = 0;
+unsigned long noticeActiveStartTimeMs = 0;
+int lastNoticeShownIndex = -1;
+
 DHT dht(DHTPIN, DHTTYPE);
 Servo curtain1;
 Servo curtain2;
@@ -120,6 +147,11 @@ unsigned long lastLocalModeChange = 0;
 
 // OLED Hardware flag
 bool oledFound = false;
+
+// Dynamic Wi-Fi Provisioning & AP Setup Mode flags
+bool isApSetupMode = false;
+String configured_ssid = "";
+String configured_pass = "";
 
 // ==========================================
 // ==========================================
@@ -765,13 +797,619 @@ void handleConfig() {
 }
 
 // ==========================================
+// --- WI-FI PROVISIONING & WEB PORTAL ---
+// ==========================================
+void handleWiFiPortal() {
+  enableCORS();
+  int n = WiFi.scanNetworks();
+
+  String html = F("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+                  "<title>NBA Smart Classroom - Wi-Fi Setup</title>"
+                  "<style>"
+                  "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0F0F0F;color:#FFF;margin:0;padding:20px;display:flex;justify-content:center;align-items:center;min-height:100vh;box-sizing:border-box;}"
+                  ".card{background:#1A1A1A;border:1px solid #2D2D2D;border-radius:16px;padding:26px;max-width:420px;width:100%;box-shadow:0 12px 30px rgba(0,0,0,0.6);}"
+                  ".badge{display:inline-block;background:rgba(253,168,58,0.15);color:#FDA83A;font-weight:700;font-size:12px;padding:4px 10px;border-radius:20px;margin-bottom:12px;}"
+                  "h1{font-size:22px;margin:0 0 6px 0;font-weight:700;color:#FFF;}"
+                  "p{color:#A0A0A0;font-size:13px;line-height:1.5;margin:0 0 20px 0;}"
+                  "label{display:block;font-size:13px;font-weight:600;color:#DDD;margin-bottom:6px;}"
+                  "select,input[type=text],input[type=password]{width:100%;box-sizing:border-box;padding:12px 14px;border-radius:10px;background:#242424;border:1px solid #333;color:#FFF;font-size:14px;margin-bottom:16px;outline:none;}"
+                  "select:focus,input:focus{border-color:#FDA83A;}"
+                  ".btn{width:100%;padding:14px;border-radius:10px;border:none;background:#FDA83A;color:#000;font-size:15px;font-weight:700;cursor:pointer;margin-top:6px;}"
+                  ".btn:active{opacity:0.85;}"
+                  ".info{margin-top:20px;padding-top:14px;border-top:1px solid #262626;font-size:12px;color:#777;display:flex;justify-content:space-between;}"
+                  "</style></head><body>"
+                  "<div class='card'>"
+                  "<div class='badge'>Controller Network Setup</div>"
+                  "<h1>Wi-Fi Configuration</h1>"
+                  "<p>Select your Wi-Fi network and enter the password to connect this classroom controller.</p>"
+                  "<form action='/savewifi' method='POST'>"
+                  "<label for='ssid'>Available Networks</label>"
+                  "<select id='ssid' name='ssid' onchange='checkCustom(this.value)'>");
+
+  if (n <= 0) {
+    html += F("<option value=''>-- No networks found (Refresh to scan) --</option>");
+  } else {
+    for (int i = 0; i < n; ++i) {
+      String s = WiFi.SSID(i);
+      int r = WiFi.RSSI(i);
+      String lock = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "" : " 🔒";
+      html += "<option value='" + s + "'>" + s + " (" + String(r) + " dBm" + lock + ")</option>";
+    }
+  }
+  html += F("<option value='__custom__'>+ Enter custom / hidden SSID...</option>"
+            "</select>"
+            "<div id='customDiv' style='display:none;'>"
+            "<label for='custom_ssid'>Custom SSID</label>"
+            "<input type='text' id='custom_ssid' name='custom_ssid' placeholder='Enter network name'>"
+            "</div>"
+            "<label for='password'>Wi-Fi Password</label>"
+            "<input type='password' id='password' name='password' placeholder='Enter password (leave blank if open)'>"
+            "<button type='submit' class='btn'>Connect & Save</button>"
+            "</form>"
+            "<div class='info'>"
+            "<span>Firmware: v");
+  html += FIRMWARE_VERSION;
+  html += F("</span>"
+            "<span>IP: 192.168.4.1</span>"
+            "</div>"
+            "</div>"
+            "<script>"
+            "function checkCustom(val){"
+            "  var c = document.getElementById('customDiv');"
+            "  c.style.display = (val === '__custom__') ? 'block' : 'none';"
+            "}"
+            "</script>"
+            "</body></html>");
+
+  server.send(200, "text/html", html);
+}
+
+void handleSaveWiFi() {
+  enableCORS();
+  String ssid = server.arg("ssid");
+  if (ssid == "__custom__") {
+    ssid = server.arg("custom_ssid");
+  }
+  String pass = server.arg("password");
+  ssid.trim();
+  pass.trim();
+
+  if (ssid.length() == 0) {
+    server.send(400, "text/html", "<h3>Error: SSID cannot be empty!</h3><p><a href='/wifi'>Go back</a></p>");
+    return;
+  }
+
+  preferences.putString("wifi_ssid", ssid);
+  preferences.putString("wifi_pass", pass);
+
+  String html = F("<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+                  "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+                  "<title>Saving Wi-Fi...</title>"
+                  "<style>"
+                  "body{font-family:sans-serif;background:#0F0F0F;color:#FFF;margin:0;display:flex;justify-content:center;align-items:center;min-height:100vh;text-align:center;padding:20px;}"
+                  ".card{background:#1A1A1A;border:1px solid #2D2D2D;border-radius:16px;padding:32px;max-width:380px;width:100%;}"
+                  "h1{color:#4CAF50;font-size:22px;margin-bottom:12px;}"
+                  "p{color:#A0A0A0;font-size:14px;line-height:1.6;}"
+                  ".net{color:#FDA83A;font-weight:bold;}"
+                  "</style></head><body>"
+                  "<div class='card'>"
+                  "<h1>&#x2705; Wi-Fi Saved!</h1>"
+                  "<p>Connecting to <span class='net'>");
+  html += ssid;
+  html += F("</span>...</p>"
+            "<p>The controller is restarting now. Please reconnect your phone to <span class='net'>");
+  html += ssid;
+  html += F("</span> to access the Smart Classroom app.</p>"
+            "</div></body></html>");
+
+  server.send(200, "text/html", html);
+
+  if (oledFound) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println(F("Wi-Fi Saved!"));
+    display.println(F("Restarting..."));
+    display.println(ssid);
+    display.display();
+  }
+
+  delay(2000);
+  ESP.restart();
+}
+
+void handleApiWiFi() {
+  enableCORS();
+  String ssid = "";
+  String pass = "";
+
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err) {
+      if (doc.containsKey("ssid")) ssid = doc["ssid"].as<String>();
+      if (doc.containsKey("password")) pass = doc["password"].as<String>();
+    }
+  }
+  if (ssid.length() == 0 && server.hasArg("ssid")) {
+    ssid = server.arg("ssid");
+    if (server.hasArg("password")) pass = server.arg("password");
+  }
+
+  ssid.trim();
+  pass.trim();
+
+  if (ssid.length() == 0) {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Missing 'ssid' parameter\"}");
+    return;
+  }
+
+  preferences.putString("wifi_ssid", ssid);
+  preferences.putString("wifi_pass", pass);
+
+  server.send(200, "application/json",
+              "{\"status\":\"ok\",\"message\":\"Wi-Fi credentials saved. Restarting controller...\",\"ssid\":\"" + ssid + "\"}");
+
+  if (oledFound) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println(F("Wi-Fi Updated!"));
+    display.println(F("Rebooting into:"));
+    display.println(ssid);
+    display.display();
+  }
+
+  delay(1500);
+  ESP.restart();
+}
+
+void handleApiWiFiScan() {
+  enableCORS();
+  int n = WiFi.scanNetworks();
+  String json = "[";
+  for (int i = 0; i < n; ++i) {
+    if (i > 0) json += ",";
+    json += "{\"ssid\":\"" + WiFi.SSID(i) + "\",\"rssi\":" + String(WiFi.RSSI(i)) +
+            ",\"secure\":" + String((WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "false" : "true") + "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+void handleResetWiFi() {
+  enableCORS();
+  preferences.remove("wifi_ssid");
+  preferences.remove("wifi_pass");
+  server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"Wi-Fi reset to defaults. Restarting in Setup mode...\"}");
+  delay(1000);
+  ESP.restart();
+}
+
+// ==========================================
+// --- DIGITAL NOTICE BOARD LOGIC (Wire1 / GPIO 13 & 15) ---
+// ==========================================
+void cleanExpiredNotices() {
+  unsigned long now = millis();
+  for (int i = 0; i < noticeCount; i++) {
+    if (notices[i].active && notices[i].durationMs > 0) {
+      if (now - notices[i].createdAtMs >= notices[i].durationMs) {
+        notices[i].active = false;
+        Serial.printf("[NOTICE] Notice '%s' expired automatically.\n", notices[i].title.c_str());
+      }
+    }
+  }
+  // Compact array
+  int writeIdx = 0;
+  for (int i = 0; i < noticeCount; i++) {
+    if (notices[i].active) {
+      if (writeIdx != i) {
+        notices[writeIdx] = notices[i];
+      }
+      writeIdx++;
+    }
+  }
+  noticeCount = writeIdx;
+}
+
+void addOrUpdateNotice(String id, String clsId, String title, String msg, String duration) {
+  cleanExpiredNotices();
+  unsigned long durMs = 0;
+  duration.toLowerCase();
+  if (duration == "1h") {
+    durMs = 3600000UL;
+  } else if (duration == "24h" || duration == "1d") {
+    durMs = 86400000UL;
+  } else {
+    durMs = 0; // "never" / until manually deleted
+  }
+
+  // Check if notice with this id already exists (update in place)
+  for (int i = 0; i < noticeCount; i++) {
+    if (notices[i].id == id) {
+      notices[i].classroomId = clsId;
+      notices[i].title = title;
+      notices[i].message = msg;
+      notices[i].duration = duration;
+      notices[i].durationMs = durMs;
+      notices[i].createdAtMs = millis();
+      notices[i].active = true;
+      Serial.printf("[NOTICE] Updated notice '%s' (Target: %s)\n", title.c_str(), clsId.c_str());
+      return;
+    }
+  }
+
+  // Add new notice
+  if (noticeCount < MAX_FIRMWARE_NOTICES) {
+    notices[noticeCount].id = id;
+    notices[noticeCount].classroomId = clsId;
+    notices[noticeCount].title = title;
+    notices[noticeCount].message = msg;
+    notices[noticeCount].duration = duration;
+    notices[noticeCount].durationMs = durMs;
+    notices[noticeCount].createdAtMs = millis();
+    notices[noticeCount].active = true;
+    noticeCount++;
+  } else {
+    // If array full, rotate out oldest notice
+    for (int i = 0; i < MAX_FIRMWARE_NOTICES - 1; i++) {
+      notices[i] = notices[i + 1];
+    }
+    int lastIdx = MAX_FIRMWARE_NOTICES - 1;
+    notices[lastIdx].id = id;
+    notices[lastIdx].classroomId = clsId;
+    notices[lastIdx].title = title;
+    notices[lastIdx].message = msg;
+    notices[lastIdx].duration = duration;
+    notices[lastIdx].durationMs = durMs;
+    notices[lastIdx].createdAtMs = millis();
+    notices[lastIdx].active = true;
+  }
+  Serial.printf("[NOTICE] Added notice '%s' (Target: %s, Duration: %s, Total: %d)\n",
+                title.c_str(), clsId.c_str(), duration.c_str(), noticeCount);
+}
+
+bool deleteNoticeById(String id) {
+  for (int i = 0; i < noticeCount; i++) {
+    if (notices[i].id == id) {
+      for (int j = i; j < noticeCount - 1; j++) {
+        notices[j] = notices[j + 1];
+      }
+      noticeCount--;
+      if (currentNoticeDisplayIndex >= noticeCount) {
+        currentNoticeDisplayIndex = 0;
+      }
+      Serial.printf("[NOTICE] Deleted notice id '%s'\n", id.c_str());
+      return true;
+    }
+  }
+  return false;
+}
+
+// Pre-counts how many lines a message requires when wrapped to maxCharsPerLine (21 chars)
+int countNoticeLines(const String &text, int maxCharsPerLine) {
+  int currentLine = 0;
+  int lineCharCount = 0;
+  int len = text.length();
+  int wordStart = 0;
+  while (wordStart < len) {
+    int nextSpace = text.indexOf(' ', wordStart);
+    int nextNewline = text.indexOf('\n', wordStart);
+    int wordEnd = len;
+    bool isNewline = false;
+
+    if (nextSpace != -1 && (nextNewline == -1 || nextSpace < nextNewline)) {
+      wordEnd = nextSpace;
+    } else if (nextNewline != -1) {
+      wordEnd = nextNewline;
+      isNewline = true;
+    }
+
+    String word = text.substring(wordStart, wordEnd);
+    int wordLen = word.length();
+
+    if (wordLen == 0 && isNewline) {
+      currentLine++;
+      lineCharCount = 0;
+      wordStart = wordEnd + 1;
+      continue;
+    }
+
+    if (lineCharCount + wordLen + (lineCharCount > 0 ? 1 : 0) > maxCharsPerLine) {
+      currentLine++;
+      lineCharCount = 0;
+    }
+
+    if (lineCharCount > 0) lineCharCount++;
+    lineCharCount += wordLen;
+
+    if (isNewline) {
+      currentLine++;
+      lineCharCount = 0;
+    }
+
+    wordStart = wordEnd + 1;
+  }
+  return currentLine + 1;
+}
+
+// Word wrapping helper for SSD1306 (with vertical scroll offset support)
+void drawNoticeWordWrap(Adafruit_SSD1306 &disp, const String &text, int startX, int startY, int maxCharsPerLine, int scrollYPixels) {
+  int currentLine = 0;
+  int lineCharCount = 0;
+  disp.setCursor(startX, startY + (currentLine * 9) - scrollYPixels);
+
+  int len = text.length();
+  int wordStart = 0;
+  while (wordStart < len) {
+    int nextSpace = text.indexOf(' ', wordStart);
+    int nextNewline = text.indexOf('\n', wordStart);
+    int wordEnd = len;
+    bool isNewline = false;
+
+    if (nextSpace != -1 && (nextNewline == -1 || nextSpace < nextNewline)) {
+      wordEnd = nextSpace;
+    } else if (nextNewline != -1) {
+      wordEnd = nextNewline;
+      isNewline = true;
+    }
+
+    String word = text.substring(wordStart, wordEnd);
+    int wordLen = word.length();
+
+    if (wordLen == 0 && isNewline) {
+      currentLine++;
+      lineCharCount = 0;
+      disp.setCursor(startX, startY + (currentLine * 9) - scrollYPixels);
+      wordStart = wordEnd + 1;
+      continue;
+    }
+
+    if (lineCharCount + wordLen + (lineCharCount > 0 ? 1 : 0) > maxCharsPerLine) {
+      currentLine++;
+      lineCharCount = 0;
+      disp.setCursor(startX, startY + (currentLine * 9) - scrollYPixels);
+    }
+
+    if (lineCharCount > 0) {
+      disp.print(" ");
+      lineCharCount++;
+    }
+
+    disp.print(word);
+    lineCharCount += wordLen;
+
+    if (isNewline) {
+      currentLine++;
+      lineCharCount = 0;
+      disp.setCursor(startX, startY + (currentLine * 9) - scrollYPixels);
+    }
+
+    wordStart = wordEnd + 1;
+  }
+}
+
+void updateNoticeBoardDisplay() {
+  if (!noticeOledFound) return;
+  unsigned long now = millis();
+
+  cleanExpiredNotices();
+
+  // Find notices targeted to Classroom A101 (or "all")
+  int eligibleIndices[MAX_FIRMWARE_NOTICES];
+  int eligibleCount = 0;
+  for (int i = 0; i < noticeCount; i++) {
+    if (notices[i].active) {
+      String cId = notices[i].classroomId;
+      cId.toLowerCase();
+      if (cId == "all" || cId == "cls-a101" || cId == "a101" || cId == CLASSROOM_1_ID) {
+        eligibleIndices[eligibleCount++] = i;
+      }
+    }
+  }
+
+  if (eligibleCount == 0) {
+    static unsigned long lastStandbyRefresh = 0;
+    if (now - lastStandbyRefresh < 500) return;
+    lastStandbyRefresh = now;
+
+    // Standby Display - clean, no room name, no Wi-Fi status
+    displayNotice.clearDisplay();
+    displayNotice.setTextColor(SSD1306_WHITE);
+    displayNotice.setTextSize(1);
+    displayNotice.setCursor(0, 12);
+    displayNotice.println(F("DIGITAL NOTICE BOARD"));
+    displayNotice.drawLine(0, 24, 128, 24, SSD1306_WHITE);
+    displayNotice.setCursor(0, 36);
+    displayNotice.println(F("  No Active Notices  "));
+    displayNotice.setCursor(0, 48);
+    displayNotice.println(F("   All caught up!    "));
+    displayNotice.display();
+    return;
+  }
+
+  if (currentNoticeDisplayIndex >= eligibleCount) {
+    currentNoticeDisplayIndex = 0;
+  }
+
+  // Detect when active notice switches (reset timer for reading top lines)
+  if (currentNoticeDisplayIndex != lastNoticeShownIndex) {
+    lastNoticeShownIndex = currentNoticeDisplayIndex;
+    noticeActiveStartTimeMs = now;
+  }
+
+  int activeNoticeIdx = eligibleIndices[currentNoticeDisplayIndex];
+  NoticeItemFirmware &item = notices[activeNoticeIdx];
+
+  // Calculate lines and scroll boundaries
+  int totalLines = countNoticeLines(item.message, 21);
+  int scrollY = 0;
+  bool isScrolling = false;
+
+  const unsigned long INITIAL_PAUSE_MS = 2500; // Pause 2.5s at top for initial reading
+  const unsigned long SCROLL_SPEED_MS = 115;   // Slower vertical scroll (1 px every 115ms ~8.7 px/sec)
+  const unsigned long END_PAUSE_MS = 2500;     // Pause 2.5s at bottom once finished before looping back
+
+  unsigned long totalCycleMs = NOTICE_ROTATION_MS; // 20s rotation delay
+
+  if (totalLines > 4) {
+    int maxScrollY = (totalLines - 4) * 9 + 3;
+    unsigned long scrollDurationMs = (unsigned long)maxScrollY * SCROLL_SPEED_MS;
+    unsigned long oneScrollCycleMs = INITIAL_PAUSE_MS + scrollDurationMs + END_PAUSE_MS;
+    
+    // Ensure notice stays visible for at least 20s (or 1 full scroll cycle if longer)
+    if (totalCycleMs < oneScrollCycleMs) totalCycleMs = oneScrollCycleMs;
+
+    unsigned long elapsed = now - noticeActiveStartTimeMs;
+    // Loop from the beginning once reached the bottom
+    unsigned long cycleElapsed = elapsed % oneScrollCycleMs;
+    if (cycleElapsed < INITIAL_PAUSE_MS) {
+      scrollY = 0;
+    } else if (cycleElapsed < INITIAL_PAUSE_MS + scrollDurationMs) {
+      scrollY = (int)((cycleElapsed - INITIAL_PAUSE_MS) / SCROLL_SPEED_MS);
+      if (scrollY > maxScrollY) scrollY = maxScrollY;
+      isScrolling = true;
+    } else {
+      scrollY = maxScrollY;
+    }
+  }
+
+  // Frame rate control: 50ms while scrolling for smooth animation, 250ms when static
+  static unsigned long lastDisplayDrawMs = 0;
+  unsigned long refreshThreshold = isScrolling ? 50 : 250;
+  if (now - lastDisplayDrawMs < refreshThreshold) {
+    return;
+  }
+  lastDisplayDrawMs = now;
+
+  // Carousel transition: advance to next notice once full display/scroll cycle completes
+  if (now - noticeActiveStartTimeMs >= totalCycleMs) {
+    noticeActiveStartTimeMs = now;
+    if (eligibleCount > 1) {
+      currentNoticeDisplayIndex = (currentNoticeDisplayIndex + 1) % eligibleCount;
+      lastNoticeShownIndex = currentNoticeDisplayIndex;
+      return;
+    }
+  }
+
+  // --- RENDER NOTICE WITH CLIPPING ---
+  displayNotice.clearDisplay();
+  displayNotice.setTextColor(SSD1306_WHITE);
+
+  // 1. Draw message text with vertical scroll offset
+  drawNoticeWordWrap(displayNotice, item.message, 0, 26, 21, scrollY);
+
+  // 2. Viewport Mask: wipe y = 0..25 to black so scrolled lines cleanly pass under the header
+  displayNotice.fillRect(0, 0, 128, 26, SSD1306_BLACK);
+
+  // 3. Header Line (y=0..10): carousel counter if multiple notices
+  displayNotice.setTextSize(1);
+  displayNotice.setCursor(0, 0);
+  if (eligibleCount > 1) {
+    displayNotice.printf("[%d/%d] NOTICE", currentNoticeDisplayIndex + 1, eligibleCount);
+  } else {
+    displayNotice.print(F("NOTICE"));
+  }
+  displayNotice.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+  // 4. Title Line (y=14): bold title
+  displayNotice.setCursor(0, 14);
+  displayNotice.print(F("> "));
+  String t = item.title;
+  if (t.length() > 19) t = t.substring(0, 16) + "...";
+  displayNotice.println(t);
+
+  displayNotice.display();
+}
+
+// REST Handlers for Notices
+void handleNoticePost() {
+  enableCORS();
+  String id = "";
+  String clsId = "all";
+  String title = "";
+  String msg = "";
+  String duration = "24h";
+
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<512> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err) {
+      if (doc.containsKey("id")) id = doc["id"].as<String>();
+      if (doc.containsKey("classroom_id")) clsId = doc["classroom_id"].as<String>();
+      if (doc.containsKey("title")) title = doc["title"].as<String>();
+      if (doc.containsKey("message")) msg = doc["message"].as<String>();
+      if (doc.containsKey("duration")) duration = doc["duration"].as<String>();
+    }
+  }
+  if (id.length() == 0 && server.hasArg("id")) id = server.arg("id");
+  if (server.hasArg("classroom_id")) clsId = server.arg("classroom_id");
+  if (title.length() == 0 && server.hasArg("title")) title = server.arg("title");
+  if (msg.length() == 0 && server.hasArg("message")) msg = server.arg("message");
+  if (server.hasArg("duration")) duration = server.arg("duration");
+
+  if (title.length() == 0 || msg.length() == 0) {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"title and message are required\"}");
+    return;
+  }
+  if (id.length() == 0) {
+    id = "notif-" + String(millis());
+  }
+
+  addOrUpdateNotice(id, clsId, title, msg, duration);
+  server.send(200, "application/json", "{\"status\":\"ok\",\"id\":\"" + id + "\",\"count\":" + String(noticeCount) + "}");
+}
+
+void handleNoticeDelete() {
+  enableCORS();
+  String id = "";
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err && doc.containsKey("id")) {
+      id = doc["id"].as<String>();
+    }
+  }
+  if (id.length() == 0 && server.hasArg("id")) id = server.arg("id");
+
+  if (id.length() == 0) {
+    server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"id is required\"}");
+    return;
+  }
+
+  bool deleted = deleteNoticeById(id);
+  server.send(200, "application/json", "{\"status\":\"ok\",\"deleted\":" + String(deleted ? "true" : "false") + ",\"count\":" + String(noticeCount) + "}");
+}
+
+void handleNoticeGet() {
+  enableCORS();
+  cleanExpiredNotices();
+  String json = "[";
+  for (int i = 0; i < noticeCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"id\":\"" + notices[i].id + "\",";
+    json += "\"classroom_id\":\"" + notices[i].classroomId + "\",";
+    json += "\"title\":\"" + notices[i].title + "\",";
+    json += "\"message\":\"" + notices[i].message + "\",";
+    json += "\"duration\":\"" + notices[i].duration + "\",";
+    json += "\"active\":" + String(notices[i].active ? "true" : "false") + "}";
+  }
+  json += "]";
+  server.send(200, "application/json", json);
+}
+
+// ==========================================
 // --- REST API: ROOT ---
 // ==========================================
 void handleRoot() {
   enableCORS();
+  if (isApSetupMode) {
+    handleWiFiPortal();
+    return;
+  }
   server.send(200, "application/json",
               "{\"system\":\"NBA Smart Classroom Controller\",\"firmware\":\"" +
-                  String(FIRMWARE_VERSION) + "\",\"status\":\"online\"}");
+                  String(FIRMWARE_VERSION) + "\",\"status\":\"online\",\"ssid\":\"" +
+                  String(WiFi.SSID()) + "\"}");
 }
 
 // Forward declaration for FreeRTOS background cloud task
@@ -850,7 +1488,7 @@ void setup() {
   curtain1.detach();
   curtain2.detach();
 
-  // 4. Initialize I2C OLED Display
+  // 4A. Initialize Primary I2C OLED Display (System & Telemetry on Wire: GPIO 21/22)
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
   if (display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
     oledFound = true;
@@ -865,16 +1503,48 @@ void setup() {
     display.display();
   } else {
     Serial.println(
-        F("[WARN] OLED SSD1306 allocation failed (check SDA/SCL pins)"));
+        F("[WARN] Telemetry OLED SSD1306 allocation failed (check GPIO 21/22)"));
   }
 
-  // 5. Connect to Wi-Fi
-  Serial.printf("Connecting to Wi-Fi SSID: %s ", WIFI_SSID);
+  // 4B. Initialize Secondary I2C OLED Display (Classroom Notice Board on Wire1: GPIO 13/15)
+  I2C_Notice.begin(NOTICE_OLED_SDA_PIN, NOTICE_OLED_SCL_PIN);
+  if (displayNotice.begin(SSD1306_SWITCHCAPVCC, NOTICE_OLED_I2C_ADDR)) {
+    noticeOledFound = true;
+    displayNotice.clearDisplay();
+    displayNotice.setTextSize(1);
+    displayNotice.setTextColor(SSD1306_WHITE);
+    displayNotice.setCursor(0, 16);
+    displayNotice.println(F("DIGITAL NOTICE BOARD"));
+    displayNotice.drawLine(0, 28, 128, 28, SSD1306_WHITE);
+    displayNotice.setCursor(0, 38);
+    displayNotice.println(F("   Initializing...   "));
+    displayNotice.display();
+    Serial.println(F("[OK] Notice Board OLED initialized on Wire1 (GPIO 13/15)"));
+  } else {
+    Serial.println(
+        F("[WARN] Notice Board OLED SSD1306 allocation failed on Wire1 (GPIO 13/15)"));
+  }
+
+  // 5. Connect to Wi-Fi (Load from NVS Preferences or fallback to config.h defaults)
+  configured_ssid = preferences.getString("wifi_ssid", DEFAULT_WIFI_SSID);
+  configured_pass = preferences.getString("wifi_pass", DEFAULT_WIFI_PASSWORD);
+
+  Serial.printf("\n[WIFI] Attempting connection to SSID: %s\n", configured_ssid.c_str());
+  if (oledFound) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println(F("NBA Smart Classroom"));
+    display.println(F("Connecting to:"));
+    display.println(configured_ssid);
+    display.println(F("Please wait..."));
+    display.display();
+  }
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(configured_ssid.c_str(), configured_pass.c_str());
 
   unsigned long startWifi = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startWifi < 15000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - startWifi < (unsigned long)(WIFI_CONNECT_TIMEOUT_SEC * 1000)) {
     delay(400);
     Serial.print(".");
   }
@@ -882,6 +1552,7 @@ void setup() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println(F("\n[OK] Wi-Fi Connected!"));
     Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+    isApSetupMode = false;
     pendingIpCloudSync = true;
 
     // 6. Start mDNS Responder (http://esp32-classroom.local)
@@ -890,28 +1561,49 @@ void setup() {
       MDNS.addService("http", "tcp", WEB_SERVER_PORT);
     }
   } else {
-    Serial.println(
-        F("\n[WARN] Wi-Fi connection timed out. Starting offline demo mode."));
+    Serial.printf("\n[WARN] Connection to '%s' failed/timed out.\n", configured_ssid.c_str());
+    Serial.println(F("[SETUP] Launching Standalone Setup Hotspot..."));
+    isApSetupMode = true;
+    WiFi.disconnect();
+    delay(100);
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
+    IPAddress apIp = WiFi.softAPIP();
+    Serial.printf("[SETUP] Setup Hotspot active: %s\n", SETUP_AP_SSID);
+    Serial.printf("[SETUP] Web Configuration Portal: http://%s\n", apIp.toString().c_str());
   }
 
-  // 7. Update OLED with IP
+  // 7. Update OLED with IP / Setup instructions
   if (oledFound) {
     display.clearDisplay();
     display.setCursor(0, 0);
-    display.println(F("NBA IoT Controller"));
-    display.println(F("---------------------"));
-    if (WiFi.status() == WL_CONNECTED) {
+    if (!isApSetupMode && WiFi.status() == WL_CONNECTED) {
+      display.println(F("NBA IoT Controller"));
+      display.println(F("---------------------"));
       display.println(F("Wi-Fi: Connected"));
+      display.println(configured_ssid);
       display.println(WiFi.localIP());
+      display.display();
+      delay(2000);
     } else {
-      display.println(F("Wi-Fi: OFFLINE"));
+      display.println(F("[WIFI SETUP MODE]"));
+      display.println(F("---------------------"));
+      display.println(F("Hotspot:"));
+      display.println(SETUP_AP_SSID);
+      display.println(F("Open in Browser:"));
+      display.println(F("192.168.4.1"));
+      display.display();
+      delay(3000);
     }
-    display.display();
-    delay(2000);
   }
 
-  // 8. Register REST API Handlers (App JSON Interface)
+  // 8. Register REST API Handlers (App JSON Interface & Web Portal)
   server.on("/", HTTP_GET, handleRoot);
+  server.on("/wifi", HTTP_GET, handleWiFiPortal);
+  server.on("/savewifi", HTTP_POST, handleSaveWiFi);
+  server.on("/api/wifi", HTTP_ANY, handleApiWiFi);
+  server.on("/api/wifi/scan", HTTP_GET, handleApiWiFiScan);
+  server.on("/api/wifi/reset", HTTP_ANY, handleResetWiFi);
   server.on("/status", HTTP_GET, handleStatus);     // Status endpoint for App
   server.on("/api/status", HTTP_GET, handleStatus); // Enhanced REST status
   server.on("/mode", HTTP_GET, handleMode);         // Mode toggle
@@ -920,6 +1612,10 @@ void setup() {
   server.on("/api/control", HTTP_ANY, handleControl);
   server.on("/config", HTTP_GET, handleConfig); // Threshold adjustments
   server.on("/api/config", HTTP_ANY, handleConfig);
+  server.on("/api/notice", HTTP_POST, handleNoticePost);
+  server.on("/api/notice", HTTP_GET, handleNoticeGet);
+  server.on("/api/notices", HTTP_GET, handleNoticeGet);
+  server.on("/api/notice/delete", HTTP_ANY, handleNoticeDelete);
 
   server.onNotFound(handleOptions); // Handle CORS preflight & 404s
   server.begin();
@@ -1310,7 +2006,7 @@ void syncWithSupabase() {
         https.end();
         client.stop();
       }
-    } else {
+    } else if (telemetryStep == 3) {
       // Slot 3: Controller Heartbeat & Live IP
       String urlCtrl =
           String(SUPABASE_URL) + "/rest/v1/controllers?id=eq.ctrl-esp32";
@@ -1330,9 +2026,44 @@ void syncWithSupabase() {
         https.end();
         client.stop();
       }
+    } else {
+      // Slot 4: Cloud Digital Notice Board Announcements
+      String urlAnn = String(SUPABASE_URL) + "/rest/v1/announcements?is_active=eq.true&order=created_at.desc&limit=8";
+      if (https.begin(client, urlAnn)) {
+        https.addHeader("apikey", SUPABASE_KEY);
+        https.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+        https.addHeader("Accept", "application/json");
+
+        int code = https.GET();
+        if (code == 200) {
+          String payload = https.getString();
+          StaticJsonDocument<2048> doc;
+          DeserializationError err = deserializeJson(doc, payload);
+          if (!err && doc.is<JsonArray>()) {
+            for (JsonObject a : doc.as<JsonArray>()) {
+              const char* aid = a["id"];
+              const char* cid = a["classroom_id"];
+              const char* atitle = a["title"];
+              const char* amsg = a["message"];
+              const char* adur = a["duration"];
+              if (aid && atitle && amsg) {
+                addOrUpdateNotice(
+                  String(aid),
+                  cid ? String(cid) : "all",
+                  String(atitle),
+                  String(amsg),
+                  adur ? String(adur) : "24h"
+                );
+              }
+            }
+          }
+        }
+        https.end();
+        client.stop();
+      }
     }
 
-    telemetryStep = (telemetryStep + 1) % 4;
+    telemetryStep = (telemetryStep + 1) % 5;
     return;
   }
 }
@@ -1443,6 +2174,24 @@ void loop() {
   if (oledFound && (now - lastDisplayUpdate >= OLED_REFRESH_MS)) {
     display.clearDisplay();
     display.setTextSize(1);
+
+    if (isApSetupMode) {
+      display.setCursor(0, 0);
+      display.println(F("[WIFI SETUP AP]"));
+      display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+      display.setCursor(0, 14);
+      display.println(F("Hotspot Active:"));
+      display.setCursor(0, 26);
+      display.println(SETUP_AP_SSID);
+      display.setCursor(0, 40);
+      display.println(F("Connect & Open:"));
+      display.setCursor(0, 52);
+      display.println(F("http://192.168.4.1"));
+      display.display();
+      lastDisplayUpdate = now;
+      return;
+    }
+
     display.setCursor(0, 0);
 
     // Line 1: IP & Mode
@@ -1497,6 +2246,9 @@ void loop() {
     display.display();
     lastDisplayUpdate = now;
   }
+
+  // 9. Refresh Classroom Digital Notice Board OLED (Rotates every 10s if multiple)
+  updateNoticeBoardDisplay();
 
   // Prevent ESP32 task starvation / watchdog triggers
   delay(2);

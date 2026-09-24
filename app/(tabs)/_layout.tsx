@@ -27,6 +27,13 @@ export default function TabLayout() {
         }}
       />
       <Tabs.Screen
+        name="announcements"
+        options={{
+          title: 'Notices',
+          tabBarAccessibilityLabel: 'Notices',
+        }}
+      />
+      <Tabs.Screen
         name="energy"
         options={{
           title: 'Energy',

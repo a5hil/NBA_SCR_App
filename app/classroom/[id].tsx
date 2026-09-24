@@ -5,6 +5,8 @@ import { Colors } from '../../constants/colors';
 import { Layout } from '../../constants/layout';
 import { ScreenHeader } from '../../components/ScreenHeader';
 import { DeviceCard } from '../../components/DeviceCard';
+import { NoticeBoardCard } from '../../components/NoticeBoardCard';
+import { FloatingBottomNav } from '../../components/FloatingBottomNav';
 import { useApp } from '../../context/AppContext';
 import { Ionicons } from '@expo/vector-icons';
 
@@ -109,14 +111,14 @@ export default function ClassroomDetailScreen() {
                   <Ionicons name="speedometer-outline" size={20} color={Colors.primary} />
                 </View>
                 <View>
-                  <Text style={styles.meterTitle}>AC Power Telemetry</Text>
-                  <Text style={styles.meterSubtitle}>ZMPT101B (GPIO 39) • ACS712 (GPIO 36)</Text>
+                  <Text style={styles.meterTitle}>Real-Time Energy Meter</Text>
+                  <Text style={styles.meterSubtitle}>Mains Line & Classroom Load</Text>
                 </View>
               </View>
               <View style={styles.meterLiveTag}>
                 <View style={[styles.hardwareDot, { backgroundColor: esp32Connected ? Colors.success : Colors.textMuted }]} />
                 <Text style={[styles.meterLiveText, { color: esp32Connected ? Colors.success : Colors.textMuted }]}>
-                  {esp32Connected ? 'RMS LIVE' : 'STANDBY'}
+                  {esp32Connected ? 'LIVE MONITOR' : 'STANDBY'}
                 </Text>
               </View>
             </View>
@@ -152,6 +154,12 @@ export default function ClassroomDetailScreen() {
           </View>
         )}
 
+        {/* Classroom Digital Notice Board (2nd OLED on Wire1 GPIO 13/15) */}
+        <NoticeBoardCard
+          filterClassroomId={classroom.id}
+          classroomName={classroom.name}
+        />
+
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Devices ({activeCount}/{classroom.devices.length} On)</Text>
         </View>
@@ -167,8 +175,10 @@ export default function ClassroomDetailScreen() {
           ))}
         </View>
         
-        <View style={{ height: 40 }} />
+        <View style={{ height: 100 }} />
       </ScrollView>
+
+      <FloatingBottomNav activeTab="classrooms" />
     </View>
   );
 }

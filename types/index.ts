@@ -189,3 +189,17 @@ export interface ESP32Telemetry {
     light2: boolean;
   };
 }
+
+export type NoticeDuration = '1h' | '24h' | 'never';
+
+export interface NoticeItem {
+  id: string;
+  classroomId: string; // 'all' for broadcast, or 'cls-a101', 'cls-a102', etc.
+  classroomName?: string;
+  title: string;
+  message: string;
+  duration: NoticeDuration;
+  createdAt: string;
+  expiresAt?: string | null;
+  isActive: boolean;
+}
