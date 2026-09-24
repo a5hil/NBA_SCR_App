@@ -625,6 +625,10 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       isLanReachableRef.current = true;
       setEsp32Connected(true);
+
+      // Opportunistically synchronize phone real-time clock to ESP32 notice board
+      const phoneEpochSec = Math.floor(Date.now() / 1000);
+      fetch(`${baseUrl}/api/time?epoch=${phoneEpochSec}`).catch(() => {});
       const telemetry: ESP32Telemetry = {
         ip: data.controller?.ip || esp32Ip,
         ssid: data.controller?.ssid,

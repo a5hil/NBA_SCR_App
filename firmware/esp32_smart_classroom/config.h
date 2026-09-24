@@ -81,6 +81,15 @@ const unsigned long SUPABASE_TELEMETRY_INTERVAL_MS =
 #define NOTICE_OLED_SCL_PIN 15 // Secondary I2C Clock
 #define NOTICE_OLED_I2C_ADDR 0x3C
 #define NOTICE_ROTATION_MS 20000 // Rotate through notices every 20 seconds
+#define CLOCK_INTERVAL_MS 120000 // Display clock slide every 2 minutes (120s)
+#define CLOCK_DISPLAY_DURATION_MS 8000 // Show clock for 8 seconds
+
+// --- NTP Real-Time Clock Configuration (Zero Hardware) ---
+#define NTP_SERVER_1 "pool.ntp.org"
+#define NTP_SERVER_2 "time.google.com"
+#define NTP_SERVER_3 "asia.pool.ntp.org"
+#define GMT_OFFSET_SEC 19800    // UTC+5:30 (Indian Standard Time: 5.5h * 3600 = 19800s)
+#define DAYLIGHT_OFFSET_SEC 0   // No daylight saving time in IST
 
 // --- Shared Environment Sensors ---
 #define DHTPIN 4      // DHT11 or DHT22 Temperature & Humidity Sensor

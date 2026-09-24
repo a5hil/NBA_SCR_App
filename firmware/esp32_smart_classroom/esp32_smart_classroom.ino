@@ -31,6 +31,8 @@
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <Wire.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "config.h"
 
@@ -1194,6 +1196,80 @@ void updateNoticeBoardDisplay() {
 
   cleanExpiredNotices();
 
+  // --- NTP CLOCK SLIDE (Every 2 minutes = CLOCK_INTERVAL_MS) ---
+  static unsigned long lastClockTriggerMs = 0;
+  static bool isClockSlideActive = false;
+  static unsigned long clockSlideStartMs = 0;
+
+  // Initialize first timer baseline
+  if (lastClockTriggerMs == 0) {
+    lastClockTriggerMs = now;
+  }
+
+  // Trigger clock slide every 2 minutes
+  if (!isClockSlideActive && (now - lastClockTriggerMs >= CLOCK_INTERVAL_MS)) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 50)) {
+      isClockSlideActive = true;
+      clockSlideStartMs = now;
+      lastClockTriggerMs = now;
+    }
+  }
+
+  // Handle active Clock Slide
+  if (isClockSlideActive) {
+    if (now - clockSlideStartMs >= CLOCK_DISPLAY_DURATION_MS) {
+      isClockSlideActive = false;
+    } else {
+      static unsigned long lastClockDrawMs = 0;
+      if (now - lastClockDrawMs < 200) return;
+      lastClockDrawMs = now;
+
+      struct tm timeinfo;
+      if (getLocalTime(&timeinfo, 50)) {
+        displayNotice.clearDisplay();
+        displayNotice.setTextColor(SSD1306_WHITE);
+
+        // 1. Date Header (Text size 1, centered)
+        char dateBuf[26];
+        strftime(dateBuf, sizeof(dateBuf), "%a, %d %b %Y", &timeinfo);
+        int dateLen = strlen(dateBuf);
+        int dateX = max(0, (128 - (dateLen * 6)) / 2);
+        displayNotice.setTextSize(1);
+        displayNotice.setCursor(dateX, 2);
+        displayNotice.print(dateBuf);
+        displayNotice.drawLine(0, 13, 128, 13, SSD1306_WHITE);
+
+        // 2. Bigger and Bolder Time (Text size 2, double-strike for bold thickness)
+        char timeBuf[12];
+        strftime(timeBuf, sizeof(timeBuf), "%I:%M %p", &timeinfo);
+        char *displayTime = timeBuf;
+        if (displayTime[0] == '0') displayTime++;
+        int timeLen = strlen(displayTime);
+        int timeX = max(0, (128 - (timeLen * 12)) / 2);
+        int timeY = 22;
+
+        displayNotice.setTextSize(2);
+        // Double-strike for prominent bold weight
+        displayNotice.setCursor(timeX, timeY);
+        displayNotice.print(displayTime);
+        displayNotice.setCursor(timeX + 1, timeY);
+        displayNotice.print(displayTime);
+
+        // 3. Bottom Line: Clean divider & Label
+        displayNotice.drawLine(0, 48, 128, 48, SSD1306_WHITE);
+        displayNotice.setTextSize(1);
+        displayNotice.setCursor(26, 53);
+        displayNotice.print(F("CAMPUS CLOCK"));
+
+        displayNotice.display();
+        return;
+      } else {
+        isClockSlideActive = false;
+      }
+    }
+  }
+
   // Find notices targeted to Classroom A101 (or "all")
   int eligibleIndices[MAX_FIRMWARE_NOTICES];
   int eligibleCount = 0;
@@ -1212,17 +1288,48 @@ void updateNoticeBoardDisplay() {
     if (now - lastStandbyRefresh < 500) return;
     lastStandbyRefresh = now;
 
-    // Standby Display - clean, no room name, no Wi-Fi status
+    // Standby Display: Live Clock with Date & Standby status
     displayNotice.clearDisplay();
     displayNotice.setTextColor(SSD1306_WHITE);
-    displayNotice.setTextSize(1);
-    displayNotice.setCursor(0, 12);
-    displayNotice.println(F("DIGITAL NOTICE BOARD"));
-    displayNotice.drawLine(0, 24, 128, 24, SSD1306_WHITE);
-    displayNotice.setCursor(0, 36);
-    displayNotice.println(F("  No Active Notices  "));
-    displayNotice.setCursor(0, 48);
-    displayNotice.println(F("   All caught up!    "));
+
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 50)) {
+      char dateBuf[26];
+      strftime(dateBuf, sizeof(dateBuf), "%A, %d %b", &timeinfo);
+      int dateLen = strlen(dateBuf);
+      int dateX = max(0, (128 - (dateLen * 6)) / 2);
+      displayNotice.setTextSize(1);
+      displayNotice.setCursor(dateX, 2);
+      displayNotice.print(dateBuf);
+      displayNotice.drawLine(0, 13, 128, 13, SSD1306_WHITE);
+
+      char timeBuf[12];
+      strftime(timeBuf, sizeof(timeBuf), "%I:%M %p", &timeinfo);
+      char *displayTime = timeBuf;
+      if (displayTime[0] == '0') displayTime++;
+      int timeLen = strlen(displayTime);
+      int timeX = max(0, (128 - (timeLen * 12)) / 2);
+
+      displayNotice.setTextSize(2);
+      displayNotice.setCursor(timeX, 21);
+      displayNotice.print(displayTime);
+      displayNotice.setCursor(timeX + 1, 21);
+      displayNotice.print(displayTime);
+
+      displayNotice.drawLine(0, 47, 128, 47, SSD1306_WHITE);
+      displayNotice.setTextSize(1);
+      displayNotice.setCursor(12, 52);
+      displayNotice.print(F("No Active Notices"));
+    } else {
+      displayNotice.setTextSize(1);
+      displayNotice.setCursor(0, 12);
+      displayNotice.println(F("DIGITAL NOTICE BOARD"));
+      displayNotice.drawLine(0, 24, 128, 24, SSD1306_WHITE);
+      displayNotice.setCursor(0, 36);
+      displayNotice.println(F("  No Active Notices  "));
+      displayNotice.setCursor(0, 48);
+      displayNotice.println(F("   All caught up!    "));
+    }
     displayNotice.display();
     return;
   }
@@ -1397,6 +1504,32 @@ void handleNoticeGet() {
   server.send(200, "application/json", json);
 }
 
+// REST Handler for Manual Time Sync (from phone app fallback)
+void handleTimeSync() {
+  enableCORS();
+  time_t epoch = 0;
+  if (server.hasArg("epoch")) {
+    epoch = (time_t)server.arg("epoch").toInt();
+  } else if (server.hasArg("plain")) {
+    StaticJsonDocument<256> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err && doc.containsKey("epoch")) {
+      epoch = (time_t)doc["epoch"].as<long>();
+    }
+  }
+
+  if (epoch > 1700000000) {
+    struct timeval tv;
+    tv.tv_sec = epoch;
+    tv.tv_usec = 0;
+    settimeofday(&tv, NULL);
+    server.send(200, "application/json", "{\"status\":\"ok\",\"synced_epoch\":" + String((long)epoch) + "}");
+    Serial.printf("[TIME] Manually synchronized epoch: %ld\n", (long)epoch);
+    return;
+  }
+  server.send(400, "application/json", "{\"error\":\"invalid epoch\"}");
+}
+
 // ==========================================
 // --- REST API: ROOT ---
 // ==========================================
@@ -1448,8 +1581,8 @@ void setup() {
                 isAutoMode ? "AUTO" : "MANUAL", (float)c1_accumulated_kwh,
                 (float)c2_accumulated_kwh);
 
-  // Sync NTP Time (IST +5:30)
-  configTime(19800, 0, "pool.ntp.org", "time.google.com");
+  // Sync NTP Time (IST +5:30) using config.h parameters
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
 
   // 1. Initialize Sensor Pins
   dht.begin();
@@ -1554,6 +1687,8 @@ void setup() {
     Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
     isApSetupMode = false;
     pendingIpCloudSync = true;
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);
+    Serial.println(F("[NTP] Initialized NTP time sync with pool servers"));
 
     // 6. Start mDNS Responder (http://esp32-classroom.local)
     if (MDNS.begin(HOSTNAME)) {
@@ -1616,6 +1751,7 @@ void setup() {
   server.on("/api/notice", HTTP_GET, handleNoticeGet);
   server.on("/api/notices", HTTP_GET, handleNoticeGet);
   server.on("/api/notice/delete", HTTP_ANY, handleNoticeDelete);
+  server.on("/api/time", HTTP_ANY, handleTimeSync);
 
   server.onNotFound(handleOptions); // Handle CORS preflight & 404s
   server.begin();
