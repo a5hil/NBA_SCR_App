@@ -23,6 +23,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
+#include <DNSServer.h>
 #include <ESP32Servo.h>
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
@@ -40,6 +41,8 @@
 // --- HARDWARE INSTANCES ---
 // ==========================================
 WebServer server(WEB_SERVER_PORT);
+DNSServer dnsServer;
+const byte DNS_PORT = 53;
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET_PIN);
 
 // --- Secondary Hardware I2C Bus (Wire1) for Classroom Notice Board OLED ---
@@ -67,6 +70,8 @@ int currentNoticeDisplayIndex = 0;
 unsigned long lastNoticeRotationMs = 0;
 unsigned long noticeActiveStartTimeMs = 0;
 int lastNoticeShownIndex = -1;
+volatile unsigned long newNoticePopupUntilMs = 0;
+volatile int activeNoticePopupIndex = 0;
 
 DHT dht(DHTPIN, DHTTYPE);
 Servo curtain1;
@@ -494,6 +499,22 @@ void enableCORS() {
 void handleOptions() {
   enableCORS();
   server.send(204);
+}
+
+void handleNotFound() {
+  enableCORS();
+  if (isApSetupMode) {
+    // Captive portal probes & unknown domains redirect to the Wi-Fi setup portal
+    String host = server.hostHeader();
+    if (host != "192.168.4.1" && host != "esp32-classroom.local") {
+      server.sendHeader("Location", "http://192.168.4.1/wifi", true);
+      server.send(302, "text/plain", "");
+      return;
+    }
+    handleWiFiPortal();
+    return;
+  }
+  handleOptions();
 }
 
 // ==========================================
@@ -1013,7 +1034,7 @@ void cleanExpiredNotices() {
   noticeCount = writeIdx;
 }
 
-void addOrUpdateNotice(String id, String clsId, String title, String msg, String duration) {
+void addOrUpdateNotice(String id, String clsId, String title, String msg, String duration, bool triggerPopup = true) {
   cleanExpiredNotices();
   unsigned long durMs = 0;
   duration.toLowerCase();
@@ -1028,6 +1049,7 @@ void addOrUpdateNotice(String id, String clsId, String title, String msg, String
   // Check if notice with this id already exists (update in place)
   for (int i = 0; i < noticeCount; i++) {
     if (notices[i].id == id) {
+      bool contentChanged = (notices[i].title != title || notices[i].message != msg);
       notices[i].classroomId = clsId;
       notices[i].title = title;
       notices[i].message = msg;
@@ -1035,12 +1057,18 @@ void addOrUpdateNotice(String id, String clsId, String title, String msg, String
       notices[i].durationMs = durMs;
       notices[i].createdAtMs = millis();
       notices[i].active = true;
+      if (triggerPopup && contentChanged) {
+        newNoticePopupUntilMs = millis() + 15000UL;
+        activeNoticePopupIndex = i;
+      }
+      currentNoticeDisplayIndex = i;
       Serial.printf("[NOTICE] Updated notice '%s' (Target: %s)\n", title.c_str(), clsId.c_str());
       return;
     }
   }
 
   // Add new notice
+  int targetIdx = noticeCount;
   if (noticeCount < MAX_FIRMWARE_NOTICES) {
     notices[noticeCount].id = id;
     notices[noticeCount].classroomId = clsId;
@@ -1050,6 +1078,7 @@ void addOrUpdateNotice(String id, String clsId, String title, String msg, String
     notices[noticeCount].durationMs = durMs;
     notices[noticeCount].createdAtMs = millis();
     notices[noticeCount].active = true;
+    targetIdx = noticeCount;
     noticeCount++;
   } else {
     // If array full, rotate out oldest notice
@@ -1065,7 +1094,13 @@ void addOrUpdateNotice(String id, String clsId, String title, String msg, String
     notices[lastIdx].durationMs = durMs;
     notices[lastIdx].createdAtMs = millis();
     notices[lastIdx].active = true;
+    targetIdx = lastIdx;
   }
+  if (triggerPopup) {
+    newNoticePopupUntilMs = millis() + 15000UL;
+    activeNoticePopupIndex = targetIdx;
+  }
+  currentNoticeDisplayIndex = targetIdx;
   Serial.printf("[NOTICE] Added notice '%s' (Target: %s, Duration: %s, Total: %d)\n",
                 title.c_str(), clsId.c_str(), duration.c_str(), noticeCount);
 }
@@ -1079,6 +1114,11 @@ bool deleteNoticeById(String id) {
       noticeCount--;
       if (currentNoticeDisplayIndex >= noticeCount) {
         currentNoticeDisplayIndex = 0;
+      }
+      if (activeNoticePopupIndex == i) {
+        newNoticePopupUntilMs = 0; // Dismiss popup immediately if active notice is deleted
+      } else if (activeNoticePopupIndex > i) {
+        activeNoticePopupIndex--;
       }
       Serial.printf("[NOTICE] Deleted notice id '%s'\n", id.c_str());
       return true;
@@ -1277,7 +1317,9 @@ void updateNoticeBoardDisplay() {
     if (notices[i].active) {
       String cId = notices[i].classroomId;
       cId.toLowerCase();
-      if (cId == "all" || cId == "cls-a101" || cId == "a101" || cId == CLASSROOM_1_ID) {
+      if (cId == "all" || cId.length() == 0 ||
+          cId == "cls-a101" || cId == "a101" || cId == CLASSROOM_1_ID ||
+          cId == "cls-a102" || cId == "a102" || cId == CLASSROOM_2_ID) {
         eligibleIndices[eligibleCount++] = i;
       }
     }
@@ -1549,6 +1591,64 @@ void handleRoot() {
 void supabaseCloudTask(void *pvParameters);
 
 // ==========================================
+// --- STANDALONE SETUP HOTSPOT (AP MODE) ---
+// ==========================================
+void startSetupHotspot() {
+  if (isApSetupMode) return;
+  isApSetupMode = true;
+  Serial.println(F("\n[SETUP] Initializing Standalone Setup Hotspot..."));
+
+  // 1. Completely disconnect & shut off STA mode to stop radio channel-hopping
+  WiFi.disconnect(true, true);
+  delay(150);
+
+  // 2. Set pure Access Point mode (WIFI_AP) so beacons are solid and stable
+  WiFi.mode(WIFI_AP);
+  delay(100);
+
+  // 3. Explicitly configure AP IP & start DHCP server on 192.168.4.1
+  IPAddress apIP(192, 168, 4, 1);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  WiFi.softAPConfig(apIP, gateway, subnet);
+
+  // 4. Start SoftAP with NULL password for open network
+  const char *apPass = (SETUP_AP_PASSWORD && strlen(SETUP_AP_PASSWORD) >= 8) ? SETUP_AP_PASSWORD : NULL;
+  bool ok = WiFi.softAP(SETUP_AP_SSID, apPass, 1, 0, 4);
+
+  if (ok) {
+    Serial.printf("[SETUP] Setup Hotspot ACTIVE: '%s'\n", SETUP_AP_SSID);
+    Serial.printf("[SETUP] Web Configuration Portal: http://%s\n", WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println(F("[ERROR] Failed to start SoftAP! Retrying..."));
+    delay(200);
+    WiFi.softAP(SETUP_AP_SSID, apPass);
+  }
+
+  // 5. Start Captive Portal DNS Server (redirects all DNS queries to 192.168.4.1)
+  dnsServer.stop();
+  dnsServer.start(DNS_PORT, "*", apIP);
+  Serial.println(F("[SETUP] Captive Portal DNS Server active on port 53"));
+
+  // 6. Update Primary OLED with setup instructions
+  if (oledFound) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println(F("[WIFI SETUP MODE]"));
+    display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+    display.setCursor(0, 14);
+    display.println(F("Hotspot Active:"));
+    display.setCursor(0, 26);
+    display.println(SETUP_AP_SSID);
+    display.setCursor(0, 40);
+    display.println(F("Connect & Open:"));
+    display.setCursor(0, 52);
+    display.println(F("http://192.168.4.1"));
+    display.display();
+  }
+}
+
+// ==========================================
 // --- SETUP INITIALIZATION ---
 // ==========================================
 void setup() {
@@ -1697,15 +1797,7 @@ void setup() {
     }
   } else {
     Serial.printf("\n[WARN] Connection to '%s' failed/timed out.\n", configured_ssid.c_str());
-    Serial.println(F("[SETUP] Launching Standalone Setup Hotspot..."));
-    isApSetupMode = true;
-    WiFi.disconnect();
-    delay(100);
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD);
-    IPAddress apIp = WiFi.softAPIP();
-    Serial.printf("[SETUP] Setup Hotspot active: %s\n", SETUP_AP_SSID);
-    Serial.printf("[SETUP] Web Configuration Portal: http://%s\n", apIp.toString().c_str());
+    startSetupHotspot();
   }
 
   // 7. Update OLED with IP / Setup instructions
@@ -1750,10 +1842,13 @@ void setup() {
   server.on("/api/notice", HTTP_POST, handleNoticePost);
   server.on("/api/notice", HTTP_GET, handleNoticeGet);
   server.on("/api/notices", HTTP_GET, handleNoticeGet);
+  server.on("/api/notice", HTTP_OPTIONS, handleOptions);
+  server.on("/api/notices", HTTP_OPTIONS, handleOptions);
   server.on("/api/notice/delete", HTTP_ANY, handleNoticeDelete);
+  server.on("/api/notice/delete", HTTP_OPTIONS, handleOptions);
   server.on("/api/time", HTTP_ANY, handleTimeSync);
 
-  server.onNotFound(handleOptions); // Handle CORS preflight & 404s
+  server.onNotFound(handleNotFound); // Captive portal redirect & CORS preflight
   server.begin();
   Serial.println(F("[OK] HTTP API Server Started"));
 
@@ -2164,7 +2259,7 @@ void syncWithSupabase() {
       }
     } else {
       // Slot 4: Cloud Digital Notice Board Announcements
-      String urlAnn = String(SUPABASE_URL) + "/rest/v1/announcements?is_active=eq.true&order=created_at.desc&limit=8";
+      String urlAnn = String(SUPABASE_URL) + "/rest/v1/notifications?type=like.notice*&order=created_at.desc&limit=8";
       if (https.begin(client, urlAnn)) {
         https.addHeader("apikey", SUPABASE_KEY);
         https.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
@@ -2181,14 +2276,19 @@ void syncWithSupabase() {
               const char* cid = a["classroom_id"];
               const char* atitle = a["title"];
               const char* amsg = a["message"];
-              const char* adur = a["duration"];
+              const char* atype = a["type"];
+              String dur = "24h";
+              if (atype && strstr(atype, "notice:") == atype) {
+                dur = String(atype + 7);
+              }
               if (aid && atitle && amsg) {
                 addOrUpdateNotice(
                   String(aid),
                   cid ? String(cid) : "all",
                   String(atitle),
                   String(amsg),
-                  adur ? String(adur) : "24h"
+                  dur,
+                  true // Triggers 15s popup if notice is new or title/msg modified
                 );
               }
             }
@@ -2222,8 +2322,30 @@ void supabaseCloudTask(void *pvParameters) {
 // --- MAIN RUNTIME LOOP ---
 // ==========================================
 void loop() {
-  // 1. Process incoming HTTP client requests
+  // 1. Process Captive Portal DNS queries if in AP setup mode
+  if (isApSetupMode) {
+    dnsServer.processNextRequest();
+  }
+
+  // 1b. Process incoming HTTP client requests
   server.handleClient();
+
+  // 1c. Wi-Fi Disconnect Watchdog:
+  // If Wi-Fi was connected but drops while running, wait WIFI_CONNECT_TIMEOUT_SEC then launch Hotspot
+  static unsigned long wifiLostTimestamp = 0;
+  if (!isApSetupMode) {
+    if (WiFi.status() != WL_CONNECTED) {
+      if (wifiLostTimestamp == 0) {
+        wifiLostTimestamp = millis();
+        Serial.println(F("\n[WIFI] Lost connection to Wi-Fi. Waiting before starting Hotspot..."));
+      } else if (millis() - wifiLostTimestamp >= (unsigned long)(WIFI_CONNECT_TIMEOUT_SEC * 1000)) {
+        Serial.printf("[WIFI] Reconnection timed out after %d sec. Launching Setup Hotspot!\n", WIFI_CONNECT_TIMEOUT_SEC);
+        startSetupHotspot();
+      }
+    } else {
+      wifiLostTimestamp = 0;
+    }
+  }
 
   // 2. Non-blocking DHT11 Environment Sampling
   static unsigned long lastDhtRead = 0;
@@ -2310,6 +2432,7 @@ void loop() {
   if (oledFound && (now - lastDisplayUpdate >= OLED_REFRESH_MS)) {
     display.clearDisplay();
     display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
 
     if (isApSetupMode) {
       display.setCursor(0, 0);
@@ -2326,6 +2449,126 @@ void loop() {
       display.display();
       lastDisplayUpdate = now;
       return;
+    }
+
+    cleanExpiredNotices();
+
+    // If secondary OLED is not connected, handle notices directly on primary OLED
+    if (!noticeOledFound) {
+      // Collect eligible notices for A101 / A102 / ALL
+      int eligibleIndices[MAX_FIRMWARE_NOTICES];
+      int eligibleCount = 0;
+      for (int i = 0; i < noticeCount; i++) {
+        if (notices[i].active) {
+          String cId = notices[i].classroomId;
+          cId.toLowerCase();
+          if (cId == "all" || cId.length() == 0 ||
+              cId == "cls-a101" || cId == "a101" || cId == CLASSROOM_1_ID ||
+              cId == "cls-a102" || cId == "a102" || cId == CLASSROOM_2_ID) {
+            eligibleIndices[eligibleCount++] = i;
+          }
+        }
+      }
+
+      // Priority 1: High-Priority Breaking Notice Popup (15s after receipt)
+      if (now < newNoticePopupUntilMs && activeNoticePopupIndex >= 0 &&
+          activeNoticePopupIndex < noticeCount && notices[activeNoticePopupIndex].active) {
+        NoticeItemFirmware &popItem = notices[activeNoticePopupIndex];
+
+        // 1. Top Inverted Alert Banner
+        display.fillRect(0, 0, 128, 12, SSD1306_WHITE);
+        display.setTextColor(SSD1306_BLACK, SSD1306_WHITE);
+        display.setCursor(6, 2);
+        display.print(F("*** NEW NOTICE ***"));
+        display.setTextColor(SSD1306_WHITE, SSD1306_BLACK);
+
+        // 2. Title Line
+        display.setCursor(0, 15);
+        display.print(F("> "));
+        String t = popItem.title;
+        if (t.length() > 19) t = t.substring(0, 16) + "...";
+        display.print(t);
+        display.drawLine(0, 24, 128, 24, SSD1306_WHITE);
+
+        // 3. Message Body (word-wrapped)
+        drawNoticeWordWrap(display, popItem.message, 0, 27, 21, 0);
+
+        // 4. Footer Line with target & timer countdown
+        display.fillRect(0, 52, 128, 12, SSD1306_BLACK);
+        display.drawLine(0, 52, 128, 52, SSD1306_WHITE);
+        display.setCursor(0, 55);
+        int secRem = (int)((newNoticePopupUntilMs - now) / 1000) + 1;
+        String tgt = popItem.classroomId;
+        if (tgt == "all" || tgt.length() == 0) tgt = "ALL";
+        else if (tgt.indexOf("101") != -1) tgt = "A101";
+        else if (tgt.indexOf("102") != -1) tgt = "A102";
+        display.printf("To:%-4s     [Alert %ds]", tgt.c_str(), secRem);
+
+        display.display();
+        lastDisplayUpdate = now;
+        return;
+      }
+
+      // Priority 2: Periodic Carousel Rotation (10s Telemetry / 8s Notice Card)
+      static unsigned long singleOledModeStartMs = 0;
+      static int singleOledScreen = 0; // 0: Telemetry, 1: Notice
+      static int singleOledNoticeIdx = 0;
+
+      if (singleOledModeStartMs == 0) singleOledModeStartMs = now;
+
+      if (singleOledScreen == 0) {
+        if (eligibleCount > 0 && (now - singleOledModeStartMs >= 10000UL)) {
+          singleOledScreen = 1;
+          singleOledModeStartMs = now;
+        }
+      } else if (singleOledScreen == 1) {
+        if (eligibleCount == 0 || (now - singleOledModeStartMs >= 8000UL)) {
+          singleOledScreen = 0;
+          singleOledModeStartMs = now;
+          if (eligibleCount > 0) {
+            singleOledNoticeIdx = (singleOledNoticeIdx + 1) % eligibleCount;
+          }
+        }
+      }
+
+      if (singleOledScreen == 1 && eligibleCount > 0) {
+        int nIdx = eligibleIndices[singleOledNoticeIdx % eligibleCount];
+        NoticeItemFirmware &item = notices[nIdx];
+
+        String tgt = item.classroomId;
+        if (tgt == "all" || tgt.length() == 0) tgt = "ALL";
+        else if (tgt.indexOf("101") != -1) tgt = "A101";
+        else if (tgt.indexOf("102") != -1) tgt = "A102";
+
+        display.setCursor(0, 0);
+        if (eligibleCount > 1) {
+          display.printf("[%d/%d] NOTICE (%s)", (singleOledNoticeIdx % eligibleCount) + 1, eligibleCount, tgt.c_str());
+        } else {
+          display.printf("NOTICE BOARD (%s)", tgt.c_str());
+        }
+        display.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+        // Title
+        display.setCursor(0, 14);
+        display.print(F("> "));
+        String t = item.title;
+        if (t.length() > 19) t = t.substring(0, 16) + "...";
+        display.print(t);
+        display.drawLine(0, 23, 128, 23, SSD1306_WHITE);
+
+        // Message Body
+        drawNoticeWordWrap(display, item.message, 0, 26, 21, 0);
+
+        // Footer
+        display.fillRect(0, 52, 128, 12, SSD1306_BLACK);
+        display.drawLine(0, 52, 128, 52, SSD1306_WHITE);
+        display.setCursor(0, 55);
+        display.printf("Duration: %s", item.duration.c_str());
+
+        display.display();
+        lastDisplayUpdate = now;
+        return;
+      }
     }
 
     display.setCursor(0, 0);

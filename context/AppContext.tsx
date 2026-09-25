@@ -349,30 +349,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setQuickControls({ allLights: false, allFans: false, allCurtains: false });
 
     try {
-      const annRes = await supabase
-        .from('announcements')
-        .select('*')
-        .eq('is_active', true)
-        .order('created_at', { ascending: false });
-      if (annRes.data) {
+      const notifRows = (notifRes.data as NotificationRow[]) || [];
+      const noticeRows = notifRows.filter(r => r.type && r.type.startsWith('notice'));
+      if (noticeRows.length > 0) {
         const now = Date.now();
-        const validNotices: NoticeItem[] = (annRes.data as any[]).map(a => ({
-          id: a.id,
-          classroomId: a.classroom_id,
-          classroomName: a.classroom_id === 'all'
-            ? 'All Classrooms (Broadcast)'
-            : (validRooms.find(r => r.id === a.classroom_id)?.name || a.classroom_id),
-          title: a.title,
-          message: a.message,
-          duration: (a.duration || '24h') as NoticeDuration,
-          createdAt: a.created_at || new Date().toISOString(),
-          expiresAt: a.expires_at || null,
-          isActive: a.is_active !== false,
-        })).filter(n => !n.expiresAt || new Date(n.expiresAt).getTime() > now);
+        const validNotices: NoticeItem[] = noticeRows.map(a => {
+          let duration: NoticeDuration = '24h';
+          if (a.type && a.type.startsWith('notice:')) {
+            duration = a.type.split(':')[1] as NoticeDuration;
+          }
+          let expiresAt: string | null = null;
+          const createdMs = new Date(a.created_at).getTime();
+          if (duration === '1h') expiresAt = new Date(createdMs + 3600000).toISOString();
+          else if (duration === '24h') expiresAt = new Date(createdMs + 86400000).toISOString();
+
+          return {
+            id: a.id,
+            classroomId: a.classroom_id || 'all',
+            classroomName: a.classroom_id === 'all'
+              ? 'All Classrooms (Broadcast)'
+              : (validRooms.find(r => r.id === a.classroom_id)?.name || a.classroom_name || a.classroom_id || 'Classroom'),
+            title: a.title,
+            message: a.message,
+            duration,
+            createdAt: a.created_at || new Date().toISOString(),
+            expiresAt,
+            isActive: true,
+          };
+        }).filter(n => !n.expiresAt || new Date(n.expiresAt).getTime() > now);
         setNotices(validNotices);
       }
     } catch (e) {
-      console.warn('Could not load announcements from Supabase:', e);
+      console.warn('Could not load notices from Supabase notifications:', e);
     }
 
     return true;
@@ -557,30 +565,42 @@ export function AppProvider({ children }: { children: ReactNode }) {
       )
       .on(
         'postgres_changes',
-        { event: '*', schema: 'public', table: 'announcements' },
+        { event: '*', schema: 'public', table: 'notifications' },
         async () => {
           try {
             const { data } = await supabase
-              .from('announcements')
+              .from('notifications')
               .select('*')
-              .eq('is_active', true)
               .order('created_at', { ascending: false });
             if (data) {
+              setNotifications(data.map(mapNotification));
               const now = Date.now();
-              setNotices(data.map((a: any) => ({
-                id: a.id,
-                classroomId: a.classroom_id,
-                classroomName: a.classroom_id === 'all' ? 'All Classrooms (Broadcast)' : a.classroom_id,
-                title: a.title,
-                message: a.message,
-                duration: (a.duration || '24h') as NoticeDuration,
-                createdAt: a.created_at || new Date().toISOString(),
-                expiresAt: a.expires_at || null,
-                isActive: a.is_active !== false,
-              })).filter((n: NoticeItem) => !n.expiresAt || new Date(n.expiresAt).getTime() > now));
+              const noticeRows = data.filter((a: any) => a.type && a.type.startsWith('notice'));
+              setNotices(noticeRows.map((a: any) => {
+                let duration: NoticeDuration = '24h';
+                if (a.type && a.type.startsWith('notice:')) {
+                  duration = a.type.split(':')[1] as NoticeDuration;
+                }
+                let expiresAt: string | null = null;
+                const createdMs = new Date(a.created_at).getTime();
+                if (duration === '1h') expiresAt = new Date(createdMs + 3600000).toISOString();
+                else if (duration === '24h') expiresAt = new Date(createdMs + 86400000).toISOString();
+
+                return {
+                  id: a.id,
+                  classroomId: a.classroom_id || 'all',
+                  classroomName: a.classroom_id === 'all' ? 'All Classrooms (Broadcast)' : (a.classroom_name || a.classroom_id),
+                  title: a.title,
+                  message: a.message,
+                  duration,
+                  createdAt: a.created_at || new Date().toISOString(),
+                  expiresAt,
+                  isActive: true,
+                };
+              }).filter((n: NoticeItem) => !n.expiresAt || new Date(n.expiresAt).getTime() > now));
             }
           } catch (e) {
-            console.error('Failed to update announcements from Realtime:', e);
+            console.error('Failed to update notices from Realtime:', e);
           }
         }
       )
@@ -1370,11 +1390,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
     );
 
     // 1. Direct LAN dispatch to ESP32 for immediate OLED update
-    if (esp32Ip) {
+    const targetIp = esp32Ip || classrooms.find(c => c.controller?.ipAddress)?.controller?.ipAddress;
+    if (targetIp) {
       try {
-        const baseUrl = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
+        const baseUrl = targetIp.startsWith('http') ? targetIp : `http://${targetIp}`;
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        const timeoutId = setTimeout(() => controller.abort(), 2500);
         fetch(`${baseUrl}/api/notice`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1393,14 +1414,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // 2. Cloud persistence in Supabase
     if (isSupabaseConfigured) {
       try {
-        await supabase.from('announcements').insert([{
+        await supabase.from('notifications').insert([{
           id: newNotice.id,
-          classroom_id: newNotice.classroomId,
+          type: `notice:${newNotice.duration || '24h'}`,
           title: newNotice.title,
           message: newNotice.message,
-          duration: newNotice.duration,
-          expires_at: newNotice.expiresAt,
-          is_active: true,
+          classroom_id: newNotice.classroomId,
+          classroom_name: newNotice.classroomName,
+          is_read: false,
           created_at: newNotice.createdAt,
         }]);
       } catch (err) {
@@ -1409,18 +1430,19 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     return true;
-  }, [esp32Ip, showToast]);
+  }, [classrooms, esp32Ip, showToast]);
 
   const deleteNotice = useCallback(async (id: string): Promise<boolean> => {
     setNotices(prev => prev.filter(n => n.id !== id));
     showToast('Notice removed from board', 'info');
 
     // 1. Direct LAN dispatch to ESP32
-    if (esp32Ip) {
+    const targetIp = esp32Ip || classrooms.find(c => c.controller?.ipAddress)?.controller?.ipAddress;
+    if (targetIp) {
       try {
-        const baseUrl = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
+        const baseUrl = targetIp.startsWith('http') ? targetIp : `http://${targetIp}`;
         const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2000);
+        const timeoutId = setTimeout(() => controller.abort(), 2500);
         fetch(`${baseUrl}/api/notice/delete`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1433,14 +1455,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // 2. Delete / deactivate in Supabase
     if (isSupabaseConfigured) {
       try {
-        await supabase.from('announcements').delete().eq('id', id);
+        await supabase.from('notifications').delete().eq('id', id);
       } catch (err) {
         console.error('Failed to delete notice from Supabase:', err);
       }
     }
 
     return true;
-  }, [esp32Ip, showToast]);
+  }, [classrooms, esp32Ip, showToast]);
 
   if (!isReady) return null;
 
