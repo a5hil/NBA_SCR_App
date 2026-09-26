@@ -441,48 +441,36 @@ void applyRelayStates() {
   if (hw_c1_light != t_c1_l) {
     digitalWrite(RELAY_CLASS_LIGHT1, t_c1_l);
     hw_c1_light = t_c1_l;
-    if (t_c1_l == RELAY_ON)
-      delay(15); // Suppress multi-relay instantaneous inrush spike
   }
 
   int t_c1_f = state_c1_fan ? RELAY_ON : RELAY_OFF;
   if (hw_c1_fan != t_c1_f) {
     digitalWrite(RELAY_CLASS_FAN1, t_c1_f);
     hw_c1_fan = t_c1_f;
-    if (t_c1_f == RELAY_ON)
-      delay(15);
   }
 
   int t_c2_l = state_c2_light ? RELAY_ON : RELAY_OFF;
   if (hw_c2_light != t_c2_l) {
     digitalWrite(RELAY_CLASS_LIGHT2, t_c2_l);
     hw_c2_light = t_c2_l;
-    if (t_c2_l == RELAY_ON)
-      delay(15);
   }
 
   int t_c2_f = state_c2_fan ? RELAY_ON : RELAY_OFF;
   if (hw_c2_fan != t_c2_f) {
     digitalWrite(RELAY_CLASS_FAN2, t_c2_f);
     hw_c2_fan = t_c2_f;
-    if (t_c2_f == RELAY_ON)
-      delay(15);
   }
 
   int t_cr1 = state_corr1_light ? RELAY_ON : RELAY_OFF;
   if (hw_corr1 != t_cr1) {
     digitalWrite(RELAY_CORRIDOR_LIGHT1, t_cr1);
     hw_corr1 = t_cr1;
-    if (t_cr1 == RELAY_ON)
-      delay(15);
   }
 
   int t_cr2 = state_corr2_light ? RELAY_ON : RELAY_OFF;
   if (hw_corr2 != t_cr2) {
     digitalWrite(RELAY_CORRIDOR_LIGHT2, t_cr2);
     hw_corr2 = t_cr2;
-    if (t_cr2 == RELAY_ON)
-      delay(15);
   }
 }
 
@@ -1723,6 +1711,7 @@ void setup() {
 
   // 4A. Initialize Primary I2C OLED Display (System & Telemetry on Wire: GPIO 21/22)
   Wire.begin(OLED_SDA_PIN, OLED_SCL_PIN);
+  Wire.setClock(400000); // Fast 400kHz I2C to eliminate display loop latency
   if (display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDR)) {
     oledFound = true;
     display.clearDisplay();
@@ -1741,6 +1730,7 @@ void setup() {
 
   // 4B. Initialize Secondary I2C OLED Display (Classroom Notice Board on Wire1: GPIO 13/15)
   I2C_Notice.begin(NOTICE_OLED_SDA_PIN, NOTICE_OLED_SCL_PIN);
+  I2C_Notice.setClock(400000); // Fast 400kHz I2C
   if (displayNotice.begin(SSD1306_SWITCHCAPVCC, NOTICE_OLED_I2C_ADDR)) {
     noticeOledFound = true;
     displayNotice.clearDisplay();
@@ -1831,14 +1821,22 @@ void setup() {
   server.on("/api/wifi", HTTP_ANY, handleApiWiFi);
   server.on("/api/wifi/scan", HTTP_GET, handleApiWiFiScan);
   server.on("/api/wifi/reset", HTTP_ANY, handleResetWiFi);
-  server.on("/status", HTTP_GET, handleStatus);     // Status endpoint for App
-  server.on("/api/status", HTTP_GET, handleStatus); // Enhanced REST status
-  server.on("/mode", HTTP_GET, handleMode);         // Mode toggle
+  server.on("/status", HTTP_ANY, handleStatus);     // Status endpoint for App
+  server.on("/status", HTTP_OPTIONS, handleOptions);
+  server.on("/api/status", HTTP_ANY, handleStatus); // Enhanced REST status
+  server.on("/api/status", HTTP_OPTIONS, handleOptions);
+  server.on("/mode", HTTP_ANY, handleMode);         // Mode toggle
+  server.on("/mode", HTTP_OPTIONS, handleOptions);
   server.on("/api/mode", HTTP_ANY, handleMode);
-  server.on("/ctrl", HTTP_GET, handleControl); // Device control
+  server.on("/api/mode", HTTP_OPTIONS, handleOptions);
+  server.on("/ctrl", HTTP_ANY, handleControl); // Device control
+  server.on("/ctrl", HTTP_OPTIONS, handleOptions);
   server.on("/api/control", HTTP_ANY, handleControl);
-  server.on("/config", HTTP_GET, handleConfig); // Threshold adjustments
+  server.on("/api/control", HTTP_OPTIONS, handleOptions);
+  server.on("/config", HTTP_ANY, handleConfig); // Threshold adjustments
+  server.on("/config", HTTP_OPTIONS, handleOptions);
   server.on("/api/config", HTTP_ANY, handleConfig);
+  server.on("/api/config", HTTP_OPTIONS, handleOptions);
   server.on("/api/notice", HTTP_POST, handleNoticePost);
   server.on("/api/notice", HTTP_GET, handleNoticeGet);
   server.on("/api/notices", HTTP_GET, handleNoticeGet);

@@ -111,15 +111,16 @@ function mapDeviceToEsp32Code(classroomId: string, device: Device): string {
 
 async function sendEsp32Command(ip: string, dev: string, st: boolean) {
   if (!ip || ip.trim() === '') return;
-  const baseUrl = ip.startsWith('http') ? ip.trim() : `http://${ip.trim()}`;
+  const cleanIp = ip.trim();
+  const baseUrl = cleanIp.startsWith('http') ? cleanIp : `http://${cleanIp}`;
   const url = `${baseUrl}/ctrl?dev=${encodeURIComponent(dev)}&st=${st ? '1' : '0'}&force=1`;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 1800);
+  const timer = setTimeout(() => controller.abort(), 1200);
   try {
     await fetch(url, { signal: controller.signal });
   } catch (e) {
     // Non-intrusive logging - gracefully handles offline controllers or simulation mode
-    console.log(`[ESP32 Sync] Controller at ${ip} offline/simulated:`, (e as Error).message);
+    console.log(`[ESP32 Sync] Direct LAN command to ${cleanIp} (${dev}=${st}):`, (e as Error).message);
   } finally {
     clearTimeout(timer);
   }
@@ -284,6 +285,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const isLanReachableRef = useRef<boolean>(false);
   const lastModeToggleRef = useRef<number>(0);
   const lastManualIpSetRef = useRef<number>(0);
+  const lastUserToggleRef = useRef<Record<string, number>>({});
+  const pendingUserToggleStateRef = useRef<Record<string, DeviceStatus>>({});
 
   const setEsp32Ip = useCallback(async (ip: string) => {
     const trimmed = ip.trim();
@@ -494,6 +497,20 @@ export function AppProvider({ children }: { children: ReactNode }) {
               }
               return;
             }
+
+            // Shield recent local toggles from stale echoes
+            const timeSinceToggle = Date.now() - (lastUserToggleRef.current[newRecord.id] || 0);
+            if (timeSinceToggle < 3500) {
+              const expectedStatus = pendingUserToggleStateRef.current[newRecord.id];
+              if (expectedStatus && newRecord.status !== expectedStatus) {
+                // Echo has stale status, ignore!
+                return;
+              } else {
+                delete lastUserToggleRef.current[newRecord.id];
+                delete pendingUserToggleStateRef.current[newRecord.id];
+              }
+            }
+
             setClassrooms(prev => prev.map(cls => {
               if (cls.id !== newRecord.classroom_id) return cls;
               const updatedDevices = cls.devices.map(dev => {
@@ -711,6 +728,34 @@ export function AppProvider({ children }: { children: ReactNode }) {
         }));
       }
 
+      // Helper to resolve device status while protecting recent user toggles from in-flight telemetry
+      const resolveDeviceStatus = (dev: Device, hardwareIsOn: boolean): { status: DeviceStatus; powerUsage: number; ratedPower: number } => {
+        const rated = dev.ratedPower || (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40);
+        const hwStatus: DeviceStatus = hardwareIsOn ? 'on' : 'off';
+        const timeSinceToggle = Date.now() - (lastUserToggleRef.current[dev.id] || 0);
+
+        if (timeSinceToggle < 3500) {
+          const expected = pendingUserToggleStateRef.current[dev.id];
+          if (expected && hwStatus !== expected) {
+            // Retain optimistic user intent while hardware or poll catches up
+            return {
+              status: dev.status,
+              ratedPower: rated,
+              powerUsage: dev.status === 'on' ? rated : 0,
+            };
+          } else {
+            delete lastUserToggleRef.current[dev.id];
+            delete pendingUserToggleStateRef.current[dev.id];
+          }
+        }
+
+        return {
+          status: hwStatus,
+          ratedPower: rated,
+          powerUsage: hardwareIsOn ? rated : 0,
+        };
+      };
+
       // Reflect hardware states into Classroom models
       setClassrooms(prev => prev.map(cls => {
         // Classroom A101 (Classroom 1) - Connected to ACS712 & ZMPT101B
@@ -718,19 +763,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const liveKwh = telemetry.c1.energyToday !== undefined ? telemetry.c1.energyToday : cls.energyToday;
           const liveCost = telemetry.c1.estimatedCost !== undefined ? telemetry.c1.estimatedCost : (liveKwh * 8.0);
           const updatedDevices = cls.devices.map(dev => {
-            const rated = dev.ratedPower || (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40);
             if (dev.category === 'light') {
-              const isOn = telemetry.c1.light;
-              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+              const res = resolveDeviceStatus(dev, telemetry.c1.light);
+              return { ...dev, ...res };
             }
             if (dev.category === 'fan') {
-              const isOn = telemetry.c1.fan;
-              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+              const res = resolveDeviceStatus(dev, telemetry.c1.fan);
+              return { ...dev, ...res };
             }
             if (dev.category === 'curtain') {
-              const isOn = telemetry.c1.curtain;
               const cRated = dev.ratedPower || 5;
-              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: cRated, powerUsage: isOn ? cRated : 0 };
+              const res = resolveDeviceStatus({ ...dev, ratedPower: cRated }, telemetry.c1.curtain);
+              return { ...dev, ...res };
             }
             return dev;
           });
@@ -767,19 +811,18 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const liveKwh = telemetry.c2.energyToday !== undefined ? telemetry.c2.energyToday : cls.energyToday;
           const liveCost = telemetry.c2.estimatedCost !== undefined ? telemetry.c2.estimatedCost : (liveKwh * 8.0);
           const updatedDevices = cls.devices.map(dev => {
-            const rated = dev.ratedPower || (dev.category === 'fan' ? 75 : dev.category === 'light' ? 60 : 40);
             if (dev.category === 'light') {
-              const isOn = telemetry.c2.light;
-              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+              const res = resolveDeviceStatus(dev, telemetry.c2.light);
+              return { ...dev, ...res };
             }
             if (dev.category === 'fan') {
-              const isOn = telemetry.c2.fan;
-              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+              const res = resolveDeviceStatus(dev, telemetry.c2.fan);
+              return { ...dev, ...res };
             }
             if (dev.category === 'curtain') {
-              const isOn = telemetry.c2.curtain;
               const cRated = dev.ratedPower || 5;
-              return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: cRated, powerUsage: isOn ? cRated : 0 };
+              const res = resolveDeviceStatus({ ...dev, ratedPower: cRated }, telemetry.c2.curtain);
+              return { ...dev, ...res };
             }
             return dev;
           });
@@ -813,9 +856,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
         if (cls.id === 'cls-corridor' || cls.id.includes('corr')) {
           const updatedDevices = cls.devices.map(dev => {
             const isDev1 = dev.id.includes('1');
-            const isOn = isDev1 ? telemetry.corridors.light1 : telemetry.corridors.light2;
-            const rated = dev.ratedPower || 40;
-            return { ...dev, status: (isOn ? 'on' : 'off') as DeviceStatus, ratedPower: rated, powerUsage: isOn ? rated : 0 };
+            const hwOn = isDev1 ? telemetry.corridors.light1 : telemetry.corridors.light2;
+            const res = resolveDeviceStatus(dev, hwOn);
+            return { ...dev, ...res };
           });
           const corLoad = updatedDevices.reduce((sum, d) => sum + (d.status === 'on' ? (d.powerUsage || 0) : 0), 0);
           return {
@@ -871,8 +914,16 @@ export function AppProvider({ children }: { children: ReactNode }) {
                 const cloudDev = devMap.get(dev.id);
                 if (!cloudDev) return dev;
                 // Protect recent optimistic toggle from being overwritten by in-flight cloud sync
-                const localUpdated = dev.lastUpdated ? new Date(dev.lastUpdated).getTime() : 0;
-                if (Date.now() - localUpdated < 4000) return dev;
+                const timeSinceToggle = Date.now() - (lastUserToggleRef.current[dev.id] || 0);
+                if (timeSinceToggle < 3500) {
+                  const expected = pendingUserToggleStateRef.current[dev.id];
+                  if (expected && cloudDev.status !== expected) {
+                    return dev;
+                  } else {
+                    delete lastUserToggleRef.current[dev.id];
+                    delete pendingUserToggleStateRef.current[dev.id];
+                  }
+                }
                 const cloudSettings = (cloudDev.settings as Record<string, unknown>) || {};
                 const rated = typeof cloudSettings.ratedPower === 'number'
                   ? cloudSettings.ratedPower
@@ -935,19 +986,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setSystemModeState(mode);
     await AsyncStorage.setItem(STORAGE_KEYS.SYSTEM_MODE, mode).catch(console.error);
 
-    // 1. FAST LAN PATH (if connected on local Wi-Fi)
-    if (esp32Ip && esp32Ip.trim() !== '') {
-      const cleanIp = esp32Ip.trim();
-      const baseUrl = cleanIp.startsWith('http') ? cleanIp : `http://${cleanIp}`;
-      try {
-        const lanController = new AbortController();
-        const lanTimeout = setTimeout(() => lanController.abort(), 2000);
-        await fetch(`${baseUrl}/mode?auto=${mode === 'auto' ? 1 : 0}`, { signal: lanController.signal });
-        clearTimeout(lanTimeout);
-      } catch {
-        // LAN failed or on remote network, Supabase path will handle
+    // 1. FAST LAN PATH (Instantly notify all reachable controller IPs over local Wi-Fi)
+    const candidateIps = new Set<string>();
+    if (esp32Ip && esp32Ip.trim()) candidateIps.add(esp32Ip.trim());
+    for (const cls of classrooms) {
+      if (cls.controller?.ipAddress && cls.controller.ipAddress.trim()) {
+        candidateIps.add(cls.controller.ipAddress.trim());
       }
     }
+
+    candidateIps.forEach(ip => {
+      const cleanIp = ip.trim();
+      const baseUrl = cleanIp.startsWith('http') ? cleanIp : `http://${cleanIp}`;
+      const lanController = new AbortController();
+      const lanTimeout = setTimeout(() => lanController.abort(), 1500);
+      fetch(`${baseUrl}/mode?auto=${mode === 'auto' ? 1 : 0}`, { signal: lanController.signal })
+        .then(() => clearTimeout(lanTimeout))
+        .catch(() => clearTimeout(lanTimeout));
+    });
 
     // 2. SUPABASE CLOUD PATH (Works on 4G/5G mobile data + syncs all remote apps)
     if (isSupabaseConfigured) {
@@ -962,7 +1018,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
 
     showToast(`Switched to ${mode.toUpperCase()} Mode`, 'info');
-  }, [esp32Ip, showToast]);
+  }, [classrooms, esp32Ip, showToast]);
 
   const toggleEsp32Mode = useCallback(async () => {
     const nextMode = systemMode === 'auto' ? 'manual' : 'auto';
@@ -979,16 +1035,30 @@ export function AppProvider({ children }: { children: ReactNode }) {
     const rated = targetDev.ratedPower || (targetDev.category === 'fan' ? 75 : targetDev.category === 'light' ? 60 : 40);
     const powerUsage = nextState ? rated : 0;
     const deviceName = targetDev.name;
-    const effectiveIp = esp32Ip || targetClass?.controller?.ipAddress;
     let newClsLoad = 0;
 
-    // 1. FAST PATH: Dispatch command directly to ESP32 hardware immediately (<5ms!) if on LAN
-    if (effectiveIp && esp32Telemetry) {
-      const devCode = mapDeviceToEsp32Code(classroomId, targetDev);
-      void sendEsp32Command(effectiveIp, devCode, nextState);
+    // Record optimistic state lock to protect UI switch from telemetry overwrites
+    lastUserToggleRef.current[deviceId] = Date.now();
+    pendingUserToggleStateRef.current[deviceId] = newStatus;
+
+    // 1. FAST LAN PATH: Dispatch command directly to ESP32 hardware immediately (<5ms)
+    const devCode = mapDeviceToEsp32Code(classroomId, targetDev);
+    const candidateIps = new Set<string>();
+    if (esp32Ip && esp32Ip.trim()) candidateIps.add(esp32Ip.trim());
+    if (targetClass?.controller?.ipAddress && targetClass.controller.ipAddress.trim()) {
+      candidateIps.add(targetClass.controller.ipAddress.trim());
+    }
+    for (const cls of classrooms) {
+      if (cls.controller?.ipAddress && cls.controller.ipAddress.trim()) {
+        candidateIps.add(cls.controller.ipAddress.trim());
+      }
     }
 
-    // 2. Optimistic local React state update
+    candidateIps.forEach(ip => {
+      void sendEsp32Command(ip, devCode, nextState);
+    });
+
+    // 2. Optimistic local React state update (Instant 0ms UI response)
     setClassrooms(prev => prev.map(cls => {
       if (cls.id !== classroomId) return cls;
       const updatedDevices = cls.devices.map(dev => {
@@ -1035,7 +1105,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     } else if (deviceName) {
       showToast(`${deviceName} is ${newStatus.toUpperCase()}`, 'success');
     }
-  }, [classrooms, esp32Ip, esp32Telemetry, setSystemMode, showToast, syncDevices, systemMode]);
+  }, [classrooms, esp32Ip, setSystemMode, showToast, syncDevices, systemMode]);
 
   const updateDeviceValue = useCallback((classroomId: string, deviceId: string, updates: Partial<Device>) => {
     let settings: Record<string, unknown> | null = null;
@@ -1142,6 +1212,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
           const existingSettings = deviceSettings(dev);
           existingSettings.ratedPower = rated;
           sync.push({ id: dev.id, data: { status: newStatus, power_usage: powerUsage, settings: existingSettings } });
+          lastUserToggleRef.current[dev.id] = Date.now();
+          pendingUserToggleStateRef.current[dev.id] = newStatus;
           return { ...dev, status: newStatus, ratedPower: rated, powerUsage, lastUpdated: new Date().toISOString() };
         });
 
@@ -1158,24 +1230,29 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }));
       if (sync.length) void syncDevices(sync);
 
-      // Dispatch to ESP32
-      if (esp32Ip) {
-        if (control === 'allLights') {
-          void sendEsp32Command(esp32Ip, 'l1', newState);
-          void sendEsp32Command(esp32Ip, 'l2', newState);
-          void sendEsp32Command(esp32Ip, 'cr1', newState);
-          void sendEsp32Command(esp32Ip, 'cr2', newState);
-        } else if (control === 'allFans') {
-          void sendEsp32Command(esp32Ip, 'f1', newState);
-          void sendEsp32Command(esp32Ip, 'f2', newState);
-        } else if (control === 'allCurtains') {
-          void sendEsp32Command(esp32Ip, 'c1', newState);
-          void sendEsp32Command(esp32Ip, 'c2', newState);
+      // Fast LAN dispatch to all candidate controller IPs
+      const candidateIps = new Set<string>();
+      if (esp32Ip && esp32Ip.trim()) candidateIps.add(esp32Ip.trim());
+      for (const c of classrooms) {
+        if (c.controller?.ipAddress && c.controller.ipAddress.trim()) {
+          candidateIps.add(c.controller.ipAddress.trim());
         }
-        setTimeout(() => {
-          void syncWithEsp32();
-        }, 300);
       }
+
+      candidateIps.forEach(ip => {
+        if (control === 'allLights') {
+          void sendEsp32Command(ip, 'l1', newState);
+          void sendEsp32Command(ip, 'l2', newState);
+          void sendEsp32Command(ip, 'cr1', newState);
+          void sendEsp32Command(ip, 'cr2', newState);
+        } else if (control === 'allFans') {
+          void sendEsp32Command(ip, 'f1', newState);
+          void sendEsp32Command(ip, 'f2', newState);
+        } else if (control === 'allCurtains') {
+          void sendEsp32Command(ip, 'c1', newState);
+          void sendEsp32Command(ip, 'c2', newState);
+        }
+      });
 
       if (systemMode === 'auto') {
         void setSystemMode('manual');
@@ -1184,7 +1261,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
       return { ...prev, [control]: newState };
     });
-  }, [esp32Ip, setSystemMode, showToast, syncDevices, syncWithEsp32, systemMode]);
+  }, [classrooms, esp32Ip, setSystemMode, showToast, syncDevices, systemMode]);
 
   const emergencyOff = useCallback(() => {
     const sync: { id: string; data: Record<string, unknown> }[] = [];
@@ -1196,6 +1273,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         const existingSettings = deviceSettings(dev);
         existingSettings.ratedPower = dev.ratedPower;
         sync.push({ id: dev.id, data: { status: 'off' as const, power_usage: 0, settings: existingSettings } });
+        lastUserToggleRef.current[dev.id] = Date.now();
+        pendingUserToggleStateRef.current[dev.id] = 'off';
         return {
           ...dev,
           status: 'off' as const,
@@ -1210,18 +1289,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
     // Also update Supabase classrooms current_load to 0
     void supabase.from('classrooms').update({ current_load: 0 }).neq('id', '');
 
-    // Hardware sync: Trigger emergency all-off on all connected ESP32 controllers
-    if (esp32Ip) {
-      void sendEsp32Command(esp32Ip, 'all', false);
+    // Hardware sync: Trigger emergency all-off on all candidate ESP32 controllers
+    const candidateIps = new Set<string>();
+    if (esp32Ip && esp32Ip.trim()) candidateIps.add(esp32Ip.trim());
+    for (const c of classrooms) {
+      if (c.controller?.ipAddress && c.controller.ipAddress.trim()) {
+        candidateIps.add(c.controller.ipAddress.trim());
+      }
     }
-    setTimeout(() => {
-      void syncWithEsp32();
-    }, 300);
+
+    candidateIps.forEach(ip => {
+      void sendEsp32Command(ip, 'all', false);
+    });
 
     if (systemMode === 'auto') {
       void setSystemMode('manual');
     }
-  }, [esp32Ip, setSystemMode, syncDevices, syncWithEsp32, systemMode]);
+  }, [classrooms, esp32Ip, setSystemMode, syncDevices, systemMode]);
 
   // Periodic Polling of ESP32 (every 3 seconds)
   useEffect(() => {

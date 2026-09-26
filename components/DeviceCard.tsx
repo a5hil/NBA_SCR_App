@@ -62,14 +62,25 @@ export function DeviceCard({ device, classroomId, onToggle }: DeviceCardProps) {
             color={isOffline ? Colors.textMuted : isOn ? Colors.primary : Colors.text} 
           />
         </View>
-        <Switch
-          value={isOn}
-          onValueChange={onToggle}
-          disabled={isOffline}
-          trackColor={{ false: Colors.surfaceTranslucent, true: Colors.primary }}
-          thumbColor={isOn ? '#FFF' : Colors.textMuted}
-          style={{ transform: [{ scale: 0.8 }] }}
-        />
+        <TouchableOpacity
+          activeOpacity={0.8}
+          onPress={(e) => {
+            e.stopPropagation();
+            if (!isOffline) onToggle();
+          }}
+          style={styles.switchWrapper}
+          hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+        >
+          <Switch
+            value={isOn}
+            onValueChange={onToggle}
+            disabled={isOffline}
+            trackColor={{ false: Colors.surfaceTranslucent, true: Colors.primary }}
+            thumbColor={isOn ? '#FFF' : Colors.textMuted}
+            style={{ transform: [{ scale: 0.85 }] }}
+            pointerEvents="none"
+          />
+        </TouchableOpacity>
       </View>
 
       <View style={styles.info}>
@@ -135,5 +146,9 @@ const styles = StyleSheet.create({
   status: {
     color: Colors.textMuted,
     fontSize: 13,
+  },
+  switchWrapper: {
+    justifyContent: 'center',
+    alignItems: 'center',
   },
 });
