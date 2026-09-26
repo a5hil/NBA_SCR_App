@@ -582,8 +582,11 @@ String buildStatusJson(bool includeTelemetry = true) {
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"uptime_sec\":" + String(millis() / 1000) + ",";
-    json += "\"free_heap\":" + String(ESP.getFreeHeap());
+    json += "\"free_heap\":" + String(ESP.getFreeHeap()) + ",";
+    json += "\"notice_count\":" + String(noticeCount);
     json += "}";
+  } else {
+    json += ",\"notice_count\":" + String(noticeCount);
   }
 
   json += "}";
@@ -1022,7 +1025,66 @@ void cleanExpiredNotices() {
   noticeCount = writeIdx;
 }
 
-void addOrUpdateNotice(String id, String clsId, String title, String msg, String duration, bool triggerPopup = true) {
+// Forward declarations for NVS persistence
+void saveNoticesToNVS();
+void loadNoticesFromNVS();
+
+void saveNoticesToNVS() {
+  StaticJsonDocument<2048> doc;
+  JsonArray arr = doc.to<JsonArray>();
+  for (int i = 0; i < noticeCount; i++) {
+    if (notices[i].active) {
+      JsonObject obj = arr.createNestedObject();
+      obj["id"] = notices[i].id;
+      obj["cls"] = notices[i].classroomId;
+      obj["t"] = notices[i].title;
+      obj["m"] = notices[i].message;
+      obj["d"] = notices[i].duration;
+    }
+  }
+  String out;
+  serializeJson(doc, out);
+  preferences.putString("notices_json", out);
+  Serial.printf("[NVS] Saved %d notices to persistent flash memory.\n", arr.size());
+}
+
+void loadNoticesFromNVS() {
+  String stored = preferences.getString("notices_json", "");
+  if (stored.length() > 5) {
+    StaticJsonDocument<2048> doc;
+    DeserializationError err = deserializeJson(doc, stored);
+    if (!err && doc.is<JsonArray>()) {
+      noticeCount = 0;
+      for (JsonObject obj : doc.as<JsonArray>()) {
+        const char* id = obj["id"];
+        const char* cls = obj["cls"];
+        const char* t = obj["t"];
+        const char* m = obj["m"];
+        const char* d = obj["d"];
+        if (id && t && m && noticeCount < MAX_FIRMWARE_NOTICES) {
+          notices[noticeCount].id = String(id);
+          notices[noticeCount].classroomId = cls ? String(cls) : "all";
+          notices[noticeCount].title = String(t);
+          notices[noticeCount].message = String(m);
+          notices[noticeCount].duration = d ? String(d) : "24h";
+
+          String durStr = notices[noticeCount].duration;
+          durStr.toLowerCase();
+          if (durStr == "1h") notices[noticeCount].durationMs = 3600000UL;
+          else if (durStr == "24h" || durStr == "1d") notices[noticeCount].durationMs = 86400000UL;
+          else notices[noticeCount].durationMs = 0;
+
+          notices[noticeCount].createdAtMs = millis();
+          notices[noticeCount].active = true;
+          noticeCount++;
+        }
+      }
+      Serial.printf("[NOTICE] Restored %d persistent notices from NVS flash memory.\n", noticeCount);
+    }
+  }
+}
+
+void addOrUpdateNotice(String id, String clsId, String title, String msg, String duration, bool triggerPopup = true, bool saveNvs = true) {
   cleanExpiredNotices();
   unsigned long durMs = 0;
   duration.toLowerCase();
@@ -1050,6 +1112,7 @@ void addOrUpdateNotice(String id, String clsId, String title, String msg, String
         activeNoticePopupIndex = i;
       }
       currentNoticeDisplayIndex = i;
+      if (saveNvs) saveNoticesToNVS();
       Serial.printf("[NOTICE] Updated notice '%s' (Target: %s)\n", title.c_str(), clsId.c_str());
       return;
     }
@@ -1089,6 +1152,7 @@ void addOrUpdateNotice(String id, String clsId, String title, String msg, String
     activeNoticePopupIndex = targetIdx;
   }
   currentNoticeDisplayIndex = targetIdx;
+  if (saveNvs) saveNoticesToNVS();
   Serial.printf("[NOTICE] Added notice '%s' (Target: %s, Duration: %s, Total: %d)\n",
                 title.c_str(), clsId.c_str(), duration.c_str(), noticeCount);
 }
@@ -1108,6 +1172,7 @@ bool deleteNoticeById(String id) {
       } else if (activeNoticePopupIndex > i) {
         activeNoticePopupIndex--;
       }
+      saveNoticesToNVS();
       Serial.printf("[NOTICE] Deleted notice id '%s'\n", id.c_str());
       return true;
     }
@@ -1534,6 +1599,48 @@ void handleNoticeGet() {
   server.send(200, "application/json", json);
 }
 
+void handleNoticesSync() {
+  enableCORS();
+  if (server.hasArg("plain")) {
+    StaticJsonDocument<4096> doc;
+    DeserializationError err = deserializeJson(doc, server.arg("plain"));
+    if (!err && doc.is<JsonArray>()) {
+      noticeCount = 0; // Completely replace with incoming active array!
+      currentNoticeDisplayIndex = 0;
+      newNoticePopupUntilMs = 0;
+      for (JsonObject obj : doc.as<JsonArray>()) {
+        const char* id = obj["id"];
+        const char* cls = obj["classroom_id"];
+        const char* t = obj["title"];
+        const char* m = obj["message"];
+        const char* d = obj["duration"];
+        if (id && t && m && noticeCount < MAX_FIRMWARE_NOTICES) {
+          notices[noticeCount].id = String(id);
+          notices[noticeCount].classroomId = cls ? String(cls) : "all";
+          notices[noticeCount].title = String(t);
+          notices[noticeCount].message = String(m);
+          notices[noticeCount].duration = d ? String(d) : "24h";
+
+          String durStr = notices[noticeCount].duration;
+          durStr.toLowerCase();
+          if (durStr == "1h") notices[noticeCount].durationMs = 3600000UL;
+          else if (durStr == "24h" || durStr == "1d") notices[noticeCount].durationMs = 86400000UL;
+          else notices[noticeCount].durationMs = 0;
+
+          notices[noticeCount].createdAtMs = millis();
+          notices[noticeCount].active = true;
+          noticeCount++;
+        }
+      }
+      saveNoticesToNVS();
+      Serial.printf("[NOTICE SYNC] Active notices synchronized (%d active).\n", noticeCount);
+      server.send(200, "application/json", "{\"status\":\"ok\",\"count\":" + String(noticeCount) + "}");
+      return;
+    }
+  }
+  server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON array\"}");
+}
+
 // REST Handler for Manual Time Sync (from phone app fallback)
 void handleTimeSync() {
   enableCORS();
@@ -1663,6 +1770,7 @@ void setup() {
   rated_c2_fan = preferences.getFloat("r_c2_f", WATTS_CLASS_FAN);
   rated_corr1 = preferences.getFloat("r_cr1", WATTS_CORR_LIGHT);
   rated_corr2 = preferences.getFloat("r_cr2", WATTS_CORR_LIGHT);
+  loadNoticesFromNVS(); // Immediately restore notices onto Notice OLED on boot
   cloud_prev_system_auto = isAutoMode;
   Serial.printf("[SYSTEM] Boot System Mode: %s | Restored Energy: C1=%.4f kWh, "
                 "C2=%.4f kWh\n",
@@ -1842,6 +1950,10 @@ void setup() {
   server.on("/api/notices", HTTP_GET, handleNoticeGet);
   server.on("/api/notice", HTTP_OPTIONS, handleOptions);
   server.on("/api/notices", HTTP_OPTIONS, handleOptions);
+  server.on("/api/notices/sync", HTTP_ANY, handleNoticesSync);
+  server.on("/api/notices/sync", HTTP_OPTIONS, handleOptions);
+  server.on("/api/notice/sync", HTTP_ANY, handleNoticesSync);
+  server.on("/api/notice/sync", HTTP_OPTIONS, handleOptions);
   server.on("/api/notice/delete", HTTP_ANY, handleNoticeDelete);
   server.on("/api/notice/delete", HTTP_OPTIONS, handleOptions);
   server.on("/api/time", HTTP_ANY, handleTimeSync);
@@ -2269,27 +2381,7 @@ void syncWithSupabase() {
           StaticJsonDocument<2048> doc;
           DeserializationError err = deserializeJson(doc, payload);
           if (!err && doc.is<JsonArray>()) {
-            for (JsonObject a : doc.as<JsonArray>()) {
-              const char* aid = a["id"];
-              const char* cid = a["classroom_id"];
-              const char* atitle = a["title"];
-              const char* amsg = a["message"];
-              const char* atype = a["type"];
-              String dur = "24h";
-              if (atype && strstr(atype, "notice:") == atype) {
-                dur = String(atype + 7);
-              }
-              if (aid && atitle && amsg) {
-                addOrUpdateNotice(
-                  String(aid),
-                  cid ? String(cid) : "all",
-                  String(atitle),
-                  String(amsg),
-                  dur,
-                  true // Triggers 15s popup if notice is new or title/msg modified
-                );
-              }
-            }
+            reconcileNoticesFromCloud(doc.as<JsonArray>());
           }
         }
         https.end();
@@ -2302,14 +2394,101 @@ void syncWithSupabase() {
   }
 }
 
+void reconcileNoticesFromCloud(JsonArray cloudNotices) {
+  NoticeItemFirmware updated[MAX_FIRMWARE_NOTICES];
+  int updatedCount = 0;
+
+  for (JsonObject a : cloudNotices) {
+    const char* aid = a["id"];
+    const char* cid = a["classroom_id"];
+    const char* atitle = a["title"];
+    const char* amsg = a["message"];
+    const char* atype = a["type"];
+    String dur = "24h";
+    if (atype && strstr(atype, "notice:") == atype) {
+      dur = String(atype + 7);
+    }
+    if (aid && atitle && amsg && updatedCount < MAX_FIRMWARE_NOTICES) {
+      updated[updatedCount].id = String(aid);
+      updated[updatedCount].classroomId = cid ? String(cid) : "all";
+      updated[updatedCount].title = String(atitle);
+      updated[updatedCount].message = String(amsg);
+      updated[updatedCount].duration = dur;
+      String durStr = dur;
+      durStr.toLowerCase();
+      if (durStr == "1h") updated[updatedCount].durationMs = 3600000UL;
+      else if (durStr == "24h" || durStr == "1d") updated[updatedCount].durationMs = 86400000UL;
+      else updated[updatedCount].durationMs = 0;
+      updated[updatedCount].createdAtMs = millis();
+      updated[updatedCount].active = true;
+      updatedCount++;
+    }
+  }
+
+  bool changed = (noticeCount != updatedCount);
+  if (!changed) {
+    for (int i = 0; i < noticeCount; i++) {
+      if (notices[i].id != updated[i].id || notices[i].title != updated[i].title || notices[i].message != updated[i].message) {
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  if (changed) {
+    noticeCount = updatedCount;
+    for (int i = 0; i < noticeCount; i++) {
+      notices[i] = updated[i];
+    }
+    if (currentNoticeDisplayIndex >= noticeCount) {
+      currentNoticeDisplayIndex = 0;
+    }
+    newNoticePopupUntilMs = 0;
+    saveNoticesToNVS();
+    Serial.printf("[SUPABASE] Cloud notices reconciled: %d active notices.\n", noticeCount);
+  }
+}
+
+// Dedicated helper to pull active notices from Supabase immediately on Wi-Fi connection
+void fetchNoticesFromSupabaseCloud() {
+  if (WiFi.status() != WL_CONNECTED || strlen(SUPABASE_URL) == 0 || strlen(SUPABASE_KEY) == 0) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(4000);
+  HTTPClient https;
+  String urlAnn = String(SUPABASE_URL) + "/rest/v1/notifications?type=like.notice*&order=created_at.desc&limit=8";
+  if (https.begin(client, urlAnn)) {
+    https.addHeader("apikey", SUPABASE_KEY);
+    https.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
+    https.addHeader("Accept", "application/json");
+
+    int code = https.GET();
+    if (code == 200) {
+      String payload = https.getString();
+      StaticJsonDocument<2048> doc;
+      DeserializationError err = deserializeJson(doc, payload);
+      if (!err && doc.is<JsonArray>()) {
+        reconcileNoticesFromCloud(doc.as<JsonArray>());
+      }
+    }
+    https.end();
+    client.stop();
+  }
+}
+
 // Dedicated FreeRTOS background task running on Core 0
 // Ensures cloud HTTPS polling NEVER blocks Core 1's local HTTP REST API / relay
 // actuation!
 void supabaseCloudTask(void *pvParameters) {
   vTaskDelay(pdMS_TO_TICKS(1500)); // Allow Wi-Fi to stabilize
+  bool initialNoticeSyncDone = false;
   for (;;) {
     if (WiFi.status() == WL_CONNECTED && strlen(SUPABASE_URL) > 0 &&
         strlen(SUPABASE_KEY) > 0) {
+      if (!initialNoticeSyncDone) {
+        fetchNoticesFromSupabaseCloud();
+        initialNoticeSyncDone = true;
+      }
       syncWithSupabase();
     }
     vTaskDelay(pdMS_TO_TICKS(60)); // Yield to FreeRTOS scheduler

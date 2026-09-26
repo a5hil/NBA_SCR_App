@@ -287,6 +287,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const lastManualIpSetRef = useRef<number>(0);
   const lastUserToggleRef = useRef<Record<string, number>>({});
   const pendingUserToggleStateRef = useRef<Record<string, DeviceStatus>>({});
+  const lastNoticeSyncRef = useRef<number>(0);
 
   const setEsp32Ip = useCallback(async (ip: string) => {
     const trimmed = ip.trim();
@@ -726,6 +727,28 @@ export function AppProvider({ children }: { children: ReactNode }) {
             value: Math.max(0, Number(val.toFixed(3))),
           })),
         }));
+      }
+
+      // Ensure ESP32 notice board is fully synchronized with app active notices
+      const espNoticeCount = Number(data.notice_count);
+      const shouldSyncNotices = (
+        (!isNaN(espNoticeCount) && espNoticeCount !== notices.length) ||
+        Date.now() - lastNoticeSyncRef.current > 30000
+      );
+
+      if (shouldSyncNotices) {
+        lastNoticeSyncRef.current = Date.now();
+        fetch(`${baseUrl}/api/notices/sync`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(notices.map(n => ({
+            id: n.id,
+            classroom_id: n.classroomId,
+            title: n.title,
+            message: n.message,
+            duration: n.duration,
+          }))),
+        }).catch(() => {});
       }
 
       // Helper to resolve device status while protecting recent user toggles from in-flight telemetry
@@ -1388,57 +1411,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const deleteNotification = useCallback((id: string) => {
-    setNotifications(prev => prev.filter(n => n.id !== id));
-    if (isSupabaseConfigured) {
-      void supabase.from('notifications').delete().eq('id', id).then(({ error }) => {
-        if (error) console.error('NOTIFICATION DELETE FAILED', error.message);
-      });
-    }
-  }, []);
-
-  const dismissAlert = useCallback((id: string) => {
-    setAlerts(prev => prev.map(a => a.id === id ? { ...a, isRead: true } : a));
-    if (isSupabaseConfigured) {
-      void supabase.from('alerts').update({ is_read: true }).eq('id', id).then(({ error }) => {
-        if (error) console.error('ALERT UPDATE FAILED', error.message);
-      });
-    }
-  }, []);
-
-  const updateEsp32WiFi = useCallback(async (ssid: string, password: string): Promise<{ success: boolean; message: string }> => {
-    const trimmedSsid = ssid.trim();
-    if (!trimmedSsid) {
-      return { success: false, message: 'SSID cannot be empty' };
-    }
-
-    if (esp32Ip) {
-      try {
-        const baseUrl = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 6000);
-        const res = await fetch(`${baseUrl}/api/wifi`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ ssid: trimmedSsid, password }),
-          signal: controller.signal,
-        });
-        clearTimeout(timeoutId);
-        if (res.ok) {
-          showToast(`Wi-Fi saved! Controller rebooting into "${trimmedSsid}"`, 'success');
-          return { success: true, message: `Wi-Fi saved! Controller is rebooting into "${trimmedSsid}".` };
-        }
-      } catch (err) {
-        console.warn('LAN Wi-Fi update failed:', err);
-      }
-    }
-
-    return {
-      success: false,
-      message: 'Could not reach ESP32 directly. Ensure your phone is connected to the same Wi-Fi or the "NBA-Smart-Classroom" setup hotspot.',
-    };
-  }, [esp32Ip, showToast]);
-
   const addNotice = useCallback(async (
     item: Omit<NoticeItem, 'id' | 'createdAt' | 'isActive'>
   ): Promise<boolean> => {
@@ -1517,24 +1489,48 @@ export function AppProvider({ children }: { children: ReactNode }) {
   }, [classrooms, esp32Ip, showToast]);
 
   const deleteNotice = useCallback(async (id: string): Promise<boolean> => {
-    setNotices(prev => prev.filter(n => n.id !== id));
+    let remainingNotices: NoticeItem[] = [];
+    setNotices(prev => {
+      remainingNotices = prev.filter(n => n.id !== id);
+      return remainingNotices;
+    });
+    setNotifications(prev => prev.filter(n => n.id !== id));
     showToast('Notice removed from board', 'info');
 
-    // 1. Direct LAN dispatch to ESP32
-    const targetIp = esp32Ip || classrooms.find(c => c.controller?.ipAddress)?.controller?.ipAddress;
-    if (targetIp) {
-      try {
-        const baseUrl = targetIp.startsWith('http') ? targetIp : `http://${targetIp}`;
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 2500);
-        fetch(`${baseUrl}/api/notice/delete`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id }),
-          signal: controller.signal,
-        }).then(() => clearTimeout(timeoutId)).catch(() => clearTimeout(timeoutId));
-      } catch {}
+    // 1. Direct LAN dispatch to all candidate ESP32 IPs
+    const candidateIps = new Set<string>();
+    if (esp32Ip && esp32Ip.trim()) candidateIps.add(esp32Ip.trim());
+    for (const c of classrooms) {
+      if (c.controller?.ipAddress && c.controller.ipAddress.trim()) {
+        candidateIps.add(c.controller.ipAddress.trim());
+      }
     }
+
+    candidateIps.forEach(ip => {
+      const cleanIp = ip.trim();
+      const baseUrl = cleanIp.startsWith('http') ? cleanIp : `http://${cleanIp}`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
+      fetch(`${baseUrl}/api/notice/delete`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+        signal: controller.signal,
+      }).then(() => clearTimeout(timeoutId)).catch(() => clearTimeout(timeoutId));
+
+      // Also trigger batch sync with remaining notices
+      fetch(`${baseUrl}/api/notices/sync`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(remainingNotices.map(n => ({
+          id: n.id,
+          classroom_id: n.classroomId,
+          title: n.title,
+          message: n.message,
+          duration: n.duration,
+        }))),
+      }).catch(() => {});
+    });
 
     // 2. Delete / deactivate in Supabase
     if (isSupabaseConfigured) {
@@ -1547,6 +1543,67 @@ export function AppProvider({ children }: { children: ReactNode }) {
 
     return true;
   }, [classrooms, esp32Ip, showToast]);
+
+  const deleteNotification = useCallback((id: string) => {
+    setNotifications(prev => prev.filter(n => n.id !== id));
+    setNotices(prev => {
+      const exists = prev.some(n => n.id === id);
+      if (exists) {
+        void deleteNotice(id);
+        return prev.filter(n => n.id !== id);
+      }
+      return prev;
+    });
+
+    if (isSupabaseConfigured) {
+      void supabase.from('notifications').delete().eq('id', id).then(({ error }) => {
+        if (error) console.error('NOTIFICATION DELETE FAILED', error.message);
+      });
+    }
+  }, [deleteNotice]);
+
+  const dismissAlert = useCallback((id: string) => {
+    setAlerts(prev => prev.map(a => a.id === id ? { ...a, isRead: true } : a));
+    if (isSupabaseConfigured) {
+      void supabase.from('alerts').update({ is_read: true }).eq('id', id).then(({ error }) => {
+        if (error) console.error('ALERT UPDATE FAILED', error.message);
+      });
+    }
+  }, []);
+
+  const updateEsp32WiFi = useCallback(async (ssid: string, password: string): Promise<{ success: boolean; message: string }> => {
+    const trimmedSsid = ssid.trim();
+    if (!trimmedSsid) {
+      return { success: false, message: 'SSID cannot be empty' };
+    }
+
+    if (esp32Ip) {
+      try {
+        const baseUrl = esp32Ip.startsWith('http') ? esp32Ip : `http://${esp32Ip}`;
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 6000);
+        const res = await fetch(`${baseUrl}/api/wifi`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ssid: trimmedSsid, password }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeoutId);
+        if (res.ok) {
+          showToast(`Wi-Fi saved! Controller rebooting into "${trimmedSsid}"`, 'success');
+          return { success: true, message: `Wi-Fi saved! Controller is rebooting into "${trimmedSsid}".` };
+        }
+      } catch (err) {
+        console.warn('LAN Wi-Fi update failed:', err);
+      }
+    }
+
+    return {
+      success: false,
+      message: 'Could not reach ESP32 directly. Ensure your phone is connected to the same Wi-Fi or the "NBA-Smart-Classroom" setup hotspot.',
+    };
+  }, [esp32Ip, showToast]);
+
 
   if (!isReady) return null;
 
